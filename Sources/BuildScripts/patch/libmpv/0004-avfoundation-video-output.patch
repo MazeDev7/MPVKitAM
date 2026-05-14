@@ -7,7 +7,7 @@ Subject: [PATCH] AVfoundation video output
  meson.build                 |   15 +
  meson.options               |    1 +
  video/out/vo.c              |    4 +
- video/out/vo_avfoundation.m | 1118 +++++++++++++++++++++++++++++++++++
+ video/out/vo_avfoundation.m | 1191 +++++++++++++++++++++++++++++++++++
  4 files changed, 1045 insertions(+)
  create mode 100644 video/out/vo_avfoundation.m
 
@@ -77,7 +77,7 @@ new file mode 100644
 index 0000000000..1b3e13aece
 --- /dev/null
 +++ b/video/out/vo_avfoundation.m
-@@ -0,0 +1,1118 @@
+@@ -0,0 +1,1191 @@
 +/*
 + * This file is part of mpv.
 + *
@@ -97,7 +97,6 @@ index 0000000000..1b3e13aece
 +
 +#include <libavutil/hwcontext.h>
 +#include <libavutil/hwcontext_videotoolbox.h>
-+
 +#include "common/common.h"
 +#include "options/m_option.h"
 +#include "osdep/timer.h"
@@ -133,6 +132,7 @@ index 0000000000..1b3e13aece
 +    __strong CALayer *osdLayer;
 +    int64_t osd_change_id;
 +    int osd_w, osd_h;
++    struct mp_osd_res osd_res;
 +
 +    // Compositing mode support
 +    bool composite_osd;
@@ -154,8 +154,12 @@ index 0000000000..1b3e13aece
 +    // Track if OSD callback was invoked this frame
 +    bool osd_callback_invoked;
 +
-+    // Display resolution for scaling subtitles (0 = no upscaling)
-+    int display_height;
++};
++
++struct avf_render_geometry {
++    int w, h;
++    struct mp_rect src, dst;
++    struct mp_osd_res osd_res;
 +};
 +
 +static CGFloat get_screen_scale(void)
@@ -168,9 +172,84 @@ index 0000000000..1b3e13aece
 +#endif
 +}
 +
-+// Helper to sync OSD layer frame with display layer frame.
-+static void sync_osd_layer_frame(struct priv *p)
++static void dispatch_main_sync_safe(dispatch_block_t block);
++
++static void update_avfoundation_geometry(struct vo *vo)
 +{
++    struct priv *p = vo->priv;
++
++    if (!p->displayLayer)
++        return;
++
++    __block int width = 0;
++    __block int height = 0;
++    AVSampleBufferDisplayLayer *displayLayer = [p->displayLayer retain];
++    dispatch_main_sync_safe(^{
++        CGFloat scale = displayLayer.contentsScale > 0 ? displayLayer.contentsScale : get_screen_scale();
++        CGSize size = displayLayer.bounds.size;
++        if (size.width <= 0 || size.height <= 0)
++            size = displayLayer.frame.size;
++
++        width = MPMAX(1, (int)(size.width * scale + 0.5));
++        height = MPMAX(1, (int)(size.height * scale + 0.5));
++    });
++    [displayLayer release];
++
++    vo->dwidth = width;
++    vo->dheight = height;
++    vo->monitor_par = 1.0;
++}
++
++static struct avf_render_geometry get_render_geometry(struct vo *vo, int frame_w, int frame_h)
++{
++    struct priv *p = vo->priv;
++    struct mp_rect src, dst;
++    struct mp_osd_res vo_osd;
++
++    update_avfoundation_geometry(vo);
++    vo_get_src_dst_rects(vo, &src, &dst, &vo_osd);
++
++    if (frame_w <= 0)
++        frame_w = vo->params ? vo->params->w : 0;
++    if (frame_h <= 0)
++        frame_h = vo->params ? vo->params->h : 0;
++
++    if (!p->composite_osd) {
++        return (struct avf_render_geometry){
++            .w = vo_osd.w,
++            .h = vo_osd.h,
++            .src = src,
++            .dst = dst,
++            .osd_res = vo_osd,
++        };
++    }
++
++    if (frame_w <= 0 || frame_h <= 0 || vo_osd.w <= 0 || vo_osd.h <= 0) {
++        return (struct avf_render_geometry){0};
++    }
++
++    int params_w = vo->params ? vo->params->w : frame_w;
++    int params_h = vo->params ? vo->params->h : frame_h;
++    if (src.x1 <= src.x0 || src.y1 <= src.y0) {
++        src = (struct mp_rect){0, 0, params_w, params_h};
++    }
++
++    return (struct avf_render_geometry){
++        .w = vo_osd.w,
++        .h = vo_osd.h,
++        .src = src,
++        .dst = dst,
++        .osd_res = vo_osd,
++    };
++}
++
++// Helper to sync OSD layer frame with display layer frame.
++static void sync_osd_layer_frame(struct vo *vo)
++{
++    struct priv *p = vo->priv;
++
++    update_avfoundation_geometry(vo);
++
 +    if (p->composite_osd || !p->osdLayer || !p->displayLayer)
 +        return;
 +    CALayer *osdLayer = [p->osdLayer retain];
@@ -189,7 +268,7 @@ index 0000000000..1b3e13aece
 +            osdLayer.frame = displayLayer.frame;
 +            osdLayer.zPosition = displayLayer.zPosition + 1;
 +        }
-+        osdLayer.contentsScale = get_screen_scale();
++        osdLayer.contentsScale = displayLayer.contentsScale > 0 ? displayLayer.contentsScale : get_screen_scale();
 +        [CATransaction commit];
 +        [osdLayer release];
 +        [displayLayer release];
@@ -617,29 +696,20 @@ index 0000000000..1b3e13aece
 +    if (!p->composite_osd && !p->osdLayer)
 +        return;
 +
-+    int w = vo->params ? vo->params->w : 0;
-+    int h = vo->params ? vo->params->h : 0;
++    int frame_w = p->next_image ? p->next_image->w : 0;
++    int frame_h = p->next_image ? p->next_image->h : 0;
++    struct avf_render_geometry geometry = get_render_geometry(vo, frame_w, frame_h);
++    struct mp_osd_res osd_res = geometry.osd_res;
 +
-+    if (w <= 0 || h <= 0)
++    if (geometry.w <= 0 || geometry.h <= 0 || osd_res.w <= 0 || osd_res.h <= 0)
 +        return;
 +
-+    // In composite mode, render subtitles at display resolution for crisp text
-+    int render_w = w;
-+    int render_h = h;
-+    if (p->composite_osd && p->display_height > 0 && h < p->display_height) {
-+        float scale = (float)p->display_height / (float)h;
-+        render_w = (int)(w * scale);
-+        render_h = p->display_height;
++    if (!osd_res_equals(p->osd_res, osd_res)) {
++        p->osd_res = osd_res;
++        p->osd_change_id = 0;
 +    }
-+
-+    p->osd_w = render_w;
-+    p->osd_h = render_h;
-+
-+    struct mp_osd_res osd_res = {
-+        .w = render_w,
-+        .h = render_h,
-+        .display_par = 1.0,
-+    };
++    p->osd_w = geometry.w;
++    p->osd_h = geometry.h;
 +
 +    static const bool formats[SUBBITMAP_COUNT] = {
 +        [SUBBITMAP_BGRA] = true,
@@ -687,14 +757,18 @@ index 0000000000..1b3e13aece
 +    size_t videoW = CVPixelBufferGetWidth(videoBuffer);
 +    size_t videoH = CVPixelBufferGetHeight(videoBuffer);
 +
-+    // Upscale to display resolution for crisp subtitles
-+    size_t outW = videoW;
-+    size_t outH = videoH;
-+    if (p->display_height > 0 && videoH < (size_t)p->display_height) {
-+        CGFloat scale = (CGFloat)p->display_height / (CGFloat)videoH;
-+        outW = (size_t)(videoW * scale);
-+        outH = (size_t)p->display_height;
-+    }
++    struct avf_render_geometry geometry = get_render_geometry(vo, (int)videoW, (int)videoH);
++    size_t outW = geometry.w > 0 ? (size_t)geometry.w : videoW;
++    size_t outH = geometry.h > 0 ? (size_t)geometry.h : videoH;
++    if (!outW || !outH)
++        return NULL;
++
++    struct mp_rect src = geometry.src;
++    struct mp_rect dst = geometry.dst;
++    if (src.x1 <= src.x0 || src.y1 <= src.y0 || dst.x1 <= dst.x0 || dst.y1 <= dst.y0)
++        return NULL;
++
++    CGRect outputRect = CGRectMake(0, 0, outW, outH);
 +
 +    // Detect original pixel format to preserve quality
 +    OSType sourceFormat = CVPixelBufferGetPixelFormatType(videoBuffer);
@@ -744,13 +818,23 @@ index 0000000000..1b3e13aece
 +            return NULL;
 +        }
 +
-+        // Scale video to output dimensions if upscaling
-+        if (outW != videoW || outH != videoH) {
-+            CGFloat scaleX = (CGFloat)outW / (CGFloat)videoW;
-+            CGFloat scaleY = (CGFloat)outH / (CGFloat)videoH;
-+            videoImage = [videoImage imageByApplyingTransform:
-+                CGAffineTransformMakeScale(scaleX, scaleY)];
-+        }
++        CGRect srcRect = CGRectMake(src.x0, videoH - src.y1,
++                                   src.x1 - src.x0, src.y1 - src.y0);
++        CGFloat dstW = dst.x1 - dst.x0;
++        CGFloat dstH = dst.y1 - dst.y0;
++        CGFloat dstY = outH - dst.y1;
++
++        videoImage = [videoImage imageByCroppingToRect:srcRect];
++        videoImage = [videoImage imageByApplyingTransform:
++            CGAffineTransformMakeTranslation(-srcRect.origin.x, -srcRect.origin.y)];
++        videoImage = [videoImage imageByApplyingTransform:
++            CGAffineTransformMakeScale(dstW / srcRect.size.width, dstH / srcRect.size.height)];
++        videoImage = [videoImage imageByApplyingTransform:
++            CGAffineTransformMakeTranslation(dst.x0, dstY)];
++
++        CIImage *background = [[CIImage imageWithColor:
++            [CIColor colorWithRed:0 green:0 blue:0 alpha:1]] imageByCroppingToRect:outputRect];
++        videoImage = [videoImage imageByCompositingOverImage:background];
 +
 +        CIImage *subtitleImage = [CIImage imageWithCGImage:p->cachedSubtitleImage];
 +
@@ -777,10 +861,10 @@ index 0000000000..1b3e13aece
 +        if (outputColorSpace) {
 +            [p->ciContext render:composited
 +                 toCVPixelBuffer:outputBuffer
-+                          bounds:composited.extent
++                          bounds:outputRect
 +                      colorSpace:outputColorSpace];
 +        } else {
-+            [p->ciContext render:composited toCVPixelBuffer:outputBuffer];
++            [p->ciContext render:composited toCVPixelBuffer:outputBuffer bounds:outputRect colorSpace:nil];
 +        }
 +    }
 +
@@ -819,6 +903,7 @@ index 0000000000..1b3e13aece
 +    });
 +    [displayLayer release];
 +    vo_set_queue_params(vo, 16 * 1000 * 1000, 1);
++    update_avfoundation_geometry(vo);
 +
 +    // Setup Metal and Core Image for compositing mode (HDR-compatible)
 +    if (p->composite_osd) {
@@ -860,16 +945,6 @@ index 0000000000..1b3e13aece
 +
 +        MP_VERBOSE(vo, "HDR-compatible compositing mode enabled with Metal\n");
 +
-+        // Get display resolution for subtitle upscaling
-+#if TARGET_OS_IPHONE
-+        CGRect screenBounds = [UIScreen mainScreen].nativeBounds;
-+        p->display_height = (int)screenBounds.size.height;
-+#else
-+        NSScreen *screen = [NSScreen mainScreen];
-+        CGFloat scaleFactor = screen.backingScaleFactor;
-+        p->display_height = (int)(screen.frame.size.height * scaleFactor);
-+#endif
-+        MP_VERBOSE(vo, "Display height for subtitle scaling: %d\n", p->display_height);
 +    }
 +
 +    // Create OSD layer only if not in composite mode
@@ -882,10 +957,10 @@ index 0000000000..1b3e13aece
 +#if !TARGET_OS_IPHONE
 +            osdLayer.autoresizingMask = kCALayerWidthSizable | kCALayerHeightSizable;
 +#endif
-+            osdLayer.contentsScale = get_screen_scale();
++            osdLayer.contentsScale = displayLayer.contentsScale > 0 ? displayLayer.contentsScale : get_screen_scale();
 +            osdLayer.backgroundColor = NULL;
 +            osdLayer.opaque = NO;
-+            osdLayer.contentsGravity = kCAGravityResizeAspect;
++            osdLayer.contentsGravity = kCAGravityResize;
 +
 +            CALayer *parent = displayLayer.superlayer;
 +            if (parent) {
@@ -1084,13 +1159,11 @@ index 0000000000..1b3e13aece
 +
 +static int reconfig(struct vo *vo, struct mp_image_params *params)
 +{
-+    struct priv *p = vo->priv;
-+
 +    MP_VERBOSE(vo, "reconfig: %dx%d\n", params->w, params->h);
 +
 +    // Clear subtitles when video configuration changes
 +    clear_subtitle_state(vo);
-+    sync_osd_layer_frame(p);
++    sync_osd_layer_frame(vo);
 +
 +    return 0;
 +}
@@ -1156,7 +1229,7 @@ index 0000000000..1b3e13aece
 +
 +    switch (request) {
 +    case VOCTRL_SET_PANSCAN:
-+        sync_osd_layer_frame(p);
++        sync_osd_layer_frame(vo);
 +        return VO_TRUE;
 +    case VOCTRL_RESET:
 +        // Called when playback stops or video changes
