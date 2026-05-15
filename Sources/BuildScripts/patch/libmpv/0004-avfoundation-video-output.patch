@@ -7,8 +7,8 @@ Subject: [PATCH] AVfoundation video output
  meson.build                 |   15 +
  meson.options               |    1 +
  video/out/vo.c              |    4 +
- video/out/vo_avfoundation.m | 1191 +++++++++++++++++++++++++++++++++++
- 4 files changed, 1045 insertions(+)
+ video/out/vo_avfoundation.m | 1288 +++++++++++++++++++++++++++++++++++
+ 4 files changed, 1308 insertions(+)
  create mode 100644 video/out/vo_avfoundation.m
 
 diff --git a/meson.build b/meson.build
@@ -77,7 +77,7 @@ new file mode 100644
 index 0000000000..1b3e13aece
 --- /dev/null
 +++ b/video/out/vo_avfoundation.m
-@@ -0,0 +1,1191 @@
+@@ -0,0 +1,1288 @@
 +/*
 + * This file is part of mpv.
 + *
@@ -128,11 +128,14 @@ index 0000000000..1b3e13aece
 +    int64_t next_present_host_ns;
 +    __strong AVSampleBufferDisplayLayer *displayLayer;
 +
-+    // OSD/Subtitle support (CALayer mode)
-+    __strong CALayer *osdLayer;
++    // OSD/Subtitle support (timed AVSampleBufferDisplayLayer overlay mode)
++    __strong AVSampleBufferDisplayLayer *osdLayer;
 +    int64_t osd_change_id;
 +    int osd_w, osd_h;
 +    struct mp_osd_res osd_res;
++    CVPixelBufferPoolRef osdPool;
++    int osd_pool_w, osd_pool_h;
++    bool osd_needs_enqueue;
 +
 +    // Compositing mode support
 +    bool composite_osd;
@@ -252,7 +255,7 @@ index 0000000000..1b3e13aece
 +
 +    if (p->composite_osd || !p->osdLayer || !p->displayLayer)
 +        return;
-+    CALayer *osdLayer = [p->osdLayer retain];
++    AVSampleBufferDisplayLayer *osdLayer = [p->osdLayer retain];
 +    AVSampleBufferDisplayLayer *displayLayer = [p->displayLayer retain];
 +    if (!osdLayer || !displayLayer) {
 +        [osdLayer release];
@@ -269,6 +272,7 @@ index 0000000000..1b3e13aece
 +            osdLayer.zPosition = displayLayer.zPosition + 1;
 +        }
 +        osdLayer.contentsScale = displayLayer.contentsScale > 0 ? displayLayer.contentsScale : get_screen_scale();
++        osdLayer.videoGravity = AVLayerVideoGravityResize;
 +        [CATransaction commit];
 +        [osdLayer release];
 +        [displayLayer release];
@@ -443,6 +447,13 @@ index 0000000000..1b3e13aece
 +        &p->sw_pool_h, &p->sw_pool_format, w, h, format, "software upload");
 +}
 +
++static bool create_osd_pool(struct vo *vo, int w, int h)
++{
++    struct priv *p = vo->priv;
++    return create_pixel_buffer_pool(vo, &p->osdPool, &p->osd_pool_w,
++        &p->osd_pool_h, NULL, w, h, kCVPixelFormatType_32BGRA, "OSD overlay");
++}
++
 +// Upload a software-decoded frame to CVPixelBuffer
 +static CVPixelBufferRef upload_software_frame(struct vo *vo, struct mp_image *mpi)
 +{
@@ -614,6 +625,116 @@ index 0000000000..1b3e13aece
 +    return result;
 +}
 +
++static CVPixelBufferRef create_osd_pixel_buffer(struct vo *vo, CGImageRef image)
++{
++    struct priv *p = vo->priv;
++    int w = p->osd_w;
++    int h = p->osd_h;
++
++    if (w <= 0 || h <= 0)
++        return NULL;
++
++    if (!create_osd_pool(vo, w, h))
++        return NULL;
++
++    CVPixelBufferRef pixbuf = NULL;
++    CVReturn status = CVPixelBufferPoolCreatePixelBuffer(
++        kCFAllocatorDefault, p->osdPool, &pixbuf);
++
++    if (status != kCVReturnSuccess || !pixbuf) {
++        MP_ERR(vo, "Failed to get OSD overlay buffer: %d\n", status);
++        return NULL;
++    }
++
++    CVPixelBufferLockBaseAddress(pixbuf, 0);
++    void *base = CVPixelBufferGetBaseAddress(pixbuf);
++    size_t stride = CVPixelBufferGetBytesPerRow(pixbuf);
++    if (!base || !stride) {
++        CVPixelBufferUnlockBaseAddress(pixbuf, 0);
++        CVPixelBufferRelease(pixbuf);
++        return NULL;
++    }
++    memset(base, 0, stride * h);
++
++    if (image) {
++        CGColorSpaceRef colorSpace = CGColorSpaceCreateDeviceRGB();
++        CGContextRef context = colorSpace ? CGBitmapContextCreate(
++            base, w, h, 8, stride, colorSpace,
++            kCGImageAlphaPremultipliedFirst | kCGBitmapByteOrder32Little
++        ) : NULL;
++
++        if (colorSpace)
++            CGColorSpaceRelease(colorSpace);
++
++        if (!context) {
++            CVPixelBufferUnlockBaseAddress(pixbuf, 0);
++            CVPixelBufferRelease(pixbuf);
++            return NULL;
++        }
++
++        CGContextDrawImage(context, CGRectMake(0, 0, w, h), image);
++        CGContextRelease(context);
++    }
++
++    CVPixelBufferUnlockBaseAddress(pixbuf, 0);
++    return pixbuf;
++}
++
++static bool enqueue_osd_sample(struct vo *vo, int64_t present_host_ns)
++{
++    struct priv *p = vo->priv;
++
++    if (p->composite_osd || !p->osd_needs_enqueue)
++        return true;
++
++    AVSampleBufferDisplayLayer *osdLayer = [p->osdLayer retain];
++    if (!osdLayer)
++        return false;
++
++    if (![osdLayer isReadyForMoreMediaData]) {
++        MP_VERBOSE(vo, "OSD layer not ready; deferring subtitle sample\n");
++        [osdLayer release];
++        return false;
++    }
++
++    CVPixelBufferRef pixbuf = create_osd_pixel_buffer(vo,
++        p->has_subtitle ? p->cachedSubtitleImage : NULL);
++    if (!pixbuf) {
++        [osdLayer release];
++        return false;
++    }
++
++    int64_t pts_ns = present_host_ns > 0 ? present_host_ns : mp_time_ns();
++    CMSampleTimingInfo info = {
++        .presentationTimeStamp = CMTimeMake(pts_ns, NSEC_PER_SEC),
++        .duration = kCMTimeInvalid,
++        .decodeTimeStamp = kCMTimeInvalid
++    };
++
++    CMFormatDescriptionRef format = NULL;
++    CMSampleBufferRef buf = NULL;
++    OSStatus err = CMVideoFormatDescriptionCreateForImageBuffer(NULL, pixbuf, &format);
++    if (err == noErr && format)
++        err = CMSampleBufferCreateReadyWithImageBuffer(NULL, pixbuf, format, &info, &buf);
++
++    if (format)
++        CFRelease(format);
++    CVPixelBufferRelease(pixbuf);
++
++    if (err != noErr || !buf) {
++        MP_ERR(vo, "Failed to create OSD sample buffer: %d\n", (int)err);
++        [osdLayer release];
++        return false;
++    }
++
++    [osdLayer enqueueSampleBuffer:buf];
++    CFRelease(buf);
++    [osdLayer release];
++
++    p->osd_needs_enqueue = false;
++    return true;
++}
++
 +// Callback for osd_draw - renders subtitle bitmaps
 +static void draw_osd_cb(void *ctx, struct sub_bitmaps *imgs)
 +{
@@ -625,26 +746,15 @@ index 0000000000..1b3e13aece
 +
 +    // Clear subtitles when there are none
 +    if (!imgs || imgs->num_parts == 0) {
-+        if (p->has_subtitle) {
++        if (p->has_subtitle || p->cachedSubtitleImage) {
 +            p->has_subtitle = false;
 +            p->osd_change_id = 0;  // Reset change_id so next subtitle renders
-+            if (p->composite_osd) {
-+                if (p->cachedSubtitleImage) {
-+                    CGImageRelease(p->cachedSubtitleImage);
-+                    p->cachedSubtitleImage = NULL;
-+                }
-+            } else {
-+                CALayer *osdLayer = [p->osdLayer retain];
-+                if (osdLayer) {
-+                    dispatch_main_sync_safe(^{
-+                        [CATransaction begin];
-+                        [CATransaction setDisableActions:YES];
-+                        osdLayer.contents = nil;
-+                        [CATransaction commit];
-+                    });
-+                    [osdLayer release];
-+                }
++            if (p->cachedSubtitleImage) {
++                CGImageRelease(p->cachedSubtitleImage);
++                p->cachedSubtitleImage = NULL;
 +            }
++            if (!p->composite_osd)
++                p->osd_needs_enqueue = true;
 +        }
 +        return;
 +    }
@@ -655,33 +765,17 @@ index 0000000000..1b3e13aece
 +        return;
 +
 +    p->osd_change_id = imgs->change_id;
-+    p->has_subtitle = true;
 +
 +    CGImageRef subtitleImage = render_subtitle_image(vo, imgs);
 +    if (!subtitleImage)
 +        return;
 +
-+    if (p->composite_osd) {
-+        // Compositing mode: cache the image for use at the next flip.
-+        if (p->cachedSubtitleImage)
-+            CGImageRelease(p->cachedSubtitleImage);
-+        p->cachedSubtitleImage = subtitleImage;
-+    } else {
-+        // CALayer mode: update layer on main thread
-+        CALayer *osdLayer = [p->osdLayer retain];
-+        if (!osdLayer) {
-+            CGImageRelease(subtitleImage);
-+            return;
-+        }
-+        dispatch_main_sync_safe(^{
-+            [CATransaction begin];
-+            [CATransaction setDisableActions:YES];
-+            osdLayer.contents = (__bridge id)subtitleImage;
-+            [CATransaction commit];
-+        });
-+        CGImageRelease(subtitleImage);
-+        [osdLayer release];
-+    }
++    if (p->cachedSubtitleImage)
++        CGImageRelease(p->cachedSubtitleImage);
++    p->cachedSubtitleImage = subtitleImage;
++    p->has_subtitle = true;
++    if (!p->composite_osd)
++        p->osd_needs_enqueue = true;
 +}
 +
 +// Render OSD/subtitles
@@ -726,23 +820,12 @@ index 0000000000..1b3e13aece
 +    if (!p->osd_callback_invoked && p->has_subtitle) {
 +        p->has_subtitle = false;
 +        p->osd_change_id = 0;
-+        if (p->composite_osd) {
-+            if (p->cachedSubtitleImage) {
-+                CGImageRelease(p->cachedSubtitleImage);
-+                p->cachedSubtitleImage = NULL;
-+            }
-+        } else if (p->osdLayer) {
-+            CALayer *osdLayer = [p->osdLayer retain];
-+            if (osdLayer) {
-+                dispatch_main_sync_safe(^{
-+                    [CATransaction begin];
-+                    [CATransaction setDisableActions:YES];
-+                    osdLayer.contents = nil;
-+                    [CATransaction commit];
-+                });
-+                [osdLayer release];
-+            }
++        if (p->cachedSubtitleImage) {
++            CGImageRelease(p->cachedSubtitleImage);
++            p->cachedSubtitleImage = NULL;
 +        }
++        if (!p->composite_osd)
++            p->osd_needs_enqueue = true;
 +    }
 +}
 +
@@ -947,11 +1030,12 @@ index 0000000000..1b3e13aece
 +
 +    }
 +
-+    // Create OSD layer only if not in composite mode
++    // Create a timed OSD sample-buffer layer only if not in composite mode.
 +    if (!p->composite_osd) {
 +        AVSampleBufferDisplayLayer *displayLayer = [p->displayLayer retain];
++        CMTimebaseRef timebase = p->timebase;
 +        dispatch_main_sync_safe(^{
-+            CALayer *osdLayer = [[CALayer layer] retain];
++            AVSampleBufferDisplayLayer *osdLayer = [[AVSampleBufferDisplayLayer alloc] init];
 +            osdLayer.frame = displayLayer.frame;
 +            osdLayer.anchorPoint = CGPointMake(0.5, 0.5);
 +#if !TARGET_OS_IPHONE
@@ -960,7 +1044,8 @@ index 0000000000..1b3e13aece
 +            osdLayer.contentsScale = displayLayer.contentsScale > 0 ? displayLayer.contentsScale : get_screen_scale();
 +            osdLayer.backgroundColor = NULL;
 +            osdLayer.opaque = NO;
-+            osdLayer.contentsGravity = kCAGravityResize;
++            osdLayer.videoGravity = AVLayerVideoGravityResize;
++            osdLayer.controlTimebase = timebase;
 +
 +            CALayer *parent = displayLayer.superlayer;
 +            if (parent) {
@@ -1075,7 +1160,9 @@ index 0000000000..1b3e13aece
 +
 +    if (p->next_image) {
 +        render_osd(vo, p->next_pts);
-+        enqueue_frame(vo, p->next_image);
++        bool enqueued = enqueue_frame(vo, p->next_image);
++        if (enqueued && !p->composite_osd)
++            enqueue_osd_sample(vo, p->next_present_host_ns);
 +    }
 +
 +    // Flush excess buffers every ~60 frames to prevent memory growth
@@ -1084,6 +1171,8 @@ index 0000000000..1b3e13aece
 +        p->frame_count = 0;
 +        if (p->outputPool)
 +            CVPixelBufferPoolFlush(p->outputPool, kCVPixelBufferPoolFlushExcessBuffers);
++        if (p->osdPool)
++            CVPixelBufferPoolFlush(p->osdPool, kCVPixelBufferPoolFlushExcessBuffers);
 +        if (p->swUploadPool)
 +            CVPixelBufferPoolFlush(p->swUploadPool, kCVPixelBufferPoolFlushExcessBuffers);
 +    }
@@ -1142,16 +1231,14 @@ index 0000000000..1b3e13aece
 +    }
 +    p->has_subtitle = false;
 +    p->osd_change_id = 0;
++    p->osd_needs_enqueue = false;
 +
 +    if (!p->composite_osd && p->osdLayer) {
-+        CALayer *osdLayer = [p->osdLayer retain];
++        AVSampleBufferDisplayLayer *osdLayer = [p->osdLayer retain];
 +        if (!osdLayer)
 +            return;
 +        dispatch_async(dispatch_get_main_queue(), ^{
-+            [CATransaction begin];
-+            [CATransaction setDisableActions:YES];
-+            osdLayer.contents = nil;
-+            [CATransaction commit];
++            [osdLayer flushAndRemoveImage];
 +            [osdLayer release];
 +        });
 +    }
@@ -1174,13 +1261,17 @@ index 0000000000..1b3e13aece
 +
 +    mp_image_unrefp(&p->next_image);
 +    [p->displayLayer flushAndRemoveImage];
++    [p->osdLayer flushAndRemoveImage];
 +
 +    if (p->timebase) {
 +        AVSampleBufferDisplayLayer *displayLayer = [p->displayLayer retain];
++        AVSampleBufferDisplayLayer *osdLayer = [p->osdLayer retain];
 +        dispatch_main_sync_safe(^{
 +            displayLayer.controlTimebase = NULL;
++            osdLayer.controlTimebase = NULL;
 +        });
 +        [displayLayer release];
++        [osdLayer release];
 +        CFRelease(p->timebase);
 +        p->timebase = NULL;
 +    }
@@ -1195,13 +1286,18 @@ index 0000000000..1b3e13aece
 +        p->outputPool = NULL;
 +    }
 +
++    if (p->osdPool) {
++        CVPixelBufferPoolRelease(p->osdPool);
++        p->osdPool = NULL;
++    }
++
 +    if (p->swUploadPool) {
 +        CVPixelBufferPoolRelease(p->swUploadPool);
 +        p->swUploadPool = NULL;
 +    }
 +
 +    if (!p->composite_osd) {
-+        CALayer *osdLayer = p->osdLayer;
++        AVSampleBufferDisplayLayer *osdLayer = p->osdLayer;
 +        p->osdLayer = nil;
 +        if (osdLayer) {
 +            dispatch_main_sync_safe(^{
@@ -1235,6 +1331,7 @@ index 0000000000..1b3e13aece
 +        // Called when playback stops or video changes
 +        clear_subtitle_state(vo);
 +        [p->displayLayer flushAndRemoveImage];
++        [p->osdLayer flushAndRemoveImage];
 +        if (p->timebase)
 +            CMTimebaseSetTime(p->timebase, CMTimeMake(mp_time_ns(), NSEC_PER_SEC));
 +        return VO_TRUE;

@@ -139,38 +139,38 @@ let package = Package(
 
         .binaryTarget(
             name: "Libavcodec",
-            url: "https://github.com/edde746/MPVKit/releases/download/securetransport-gpl/Libavcodec.xcframework.zip",
-            checksum: "383d082648e6dd34f9ec86c98da9516db13d761ba972415437bc0b4a673a26d8"
+            url: "https://github.com/edde746/MPVKit/releases/download/avfoundation-dv-hdr-osd/Libavcodec.xcframework.zip",
+            checksum: "d994b529d1cd81bdd931ede930b9ce1ec524440659cba5f3e25eccc399a08c56"
         ),
         .binaryTarget(
             name: "Libavdevice",
-            url: "https://github.com/edde746/MPVKit/releases/download/securetransport-gpl/Libavdevice.xcframework.zip",
-            checksum: "5f17e4b1beb9b2ba7d920de361e75e2f3ed681664fb410205a6f9be7022a011e"
+            url: "https://github.com/edde746/MPVKit/releases/download/avfoundation-dv-hdr-osd/Libavdevice.xcframework.zip",
+            checksum: "2f8117f28dd0e30786a225380c04931305bafca55b3730ff37b63454ef9a513c"
         ),
         .binaryTarget(
             name: "Libavformat",
-            url: "https://github.com/edde746/MPVKit/releases/download/securetransport-gpl/Libavformat.xcframework.zip",
-            checksum: "604d86d589c7c3931dda7670b8549f82674939f3937f4d583a42fbf56e20f13b"
+            url: "https://github.com/edde746/MPVKit/releases/download/avfoundation-dv-hdr-osd/Libavformat.xcframework.zip",
+            checksum: "73ded25262a5e2406e7347f20624779d46be93508aac6a86cbda05362016853e"
         ),
         .binaryTarget(
             name: "Libavfilter",
-            url: "https://github.com/edde746/MPVKit/releases/download/securetransport-gpl/Libavfilter.xcframework.zip",
-            checksum: "7b1460f6809e90be8c253c611343f8ba5ab09b16b0ec5a1fea88c30df2db3926"
+            url: "https://github.com/edde746/MPVKit/releases/download/avfoundation-dv-hdr-osd/Libavfilter.xcframework.zip",
+            checksum: "f1d8a88144f6e540df56399f1f4f20788487765bddae2fa86f7d59668c0f1077"
         ),
         .binaryTarget(
             name: "Libavutil",
-            url: "https://github.com/edde746/MPVKit/releases/download/securetransport-gpl/Libavutil.xcframework.zip",
-            checksum: "f154a8edc5928e6c5488277d1830cbc4c14dde7a124a9ae99f244169bf43e900"
+            url: "https://github.com/edde746/MPVKit/releases/download/avfoundation-dv-hdr-osd/Libavutil.xcframework.zip",
+            checksum: "d0063b29f15a5f2932708e36b6f44314d19e26fae7a125d6c637f2ff609e8ad4"
         ),
         .binaryTarget(
             name: "Libswresample",
-            url: "https://github.com/edde746/MPVKit/releases/download/securetransport-gpl/Libswresample.xcframework.zip",
-            checksum: "9e2e8077635bb52956c5df64e582b802c77ae5943458591ec1fc79fd5351f6bd"
+            url: "https://github.com/edde746/MPVKit/releases/download/avfoundation-dv-hdr-osd/Libswresample.xcframework.zip",
+            checksum: "06f08582e21a883b674500b64a858af72454519ac8a7ebf810e4bc51c95ec4a2"
         ),
         .binaryTarget(
             name: "Libswscale",
-            url: "https://github.com/edde746/MPVKit/releases/download/securetransport-gpl/Libswscale.xcframework.zip",
-            checksum: "81b34cdf6b1b9d4b5e50e5d7baedd43bc01c2b9c9fc4a42b3e4997b3284b79b8"
+            url: "https://github.com/edde746/MPVKit/releases/download/avfoundation-dv-hdr-osd/Libswscale.xcframework.zip",
+            checksum: "687d18766ab89812bac84be9076cc84c1c986884471df6569f929655d947ef7a"
         ),
 
         .binaryTarget(
@@ -181,8 +181,8 @@ let package = Package(
 
         .binaryTarget(
             name: "Libmpv",
-            url: "https://github.com/edde746/MPVKit/releases/download/avfoundation-crop-osd/Libmpv.xcframework.zip",
-            checksum: "4d59dbfa5505475bb789e206cb7c3c9d96a249d760d460d120630e914d0e6a27"
+            url: "https://github.com/edde746/MPVKit/releases/download/avfoundation-dv-hdr-osd/Libmpv.xcframework.zip",
+            checksum: "d664fe40b0267a1f12887f6e727fbb6ca9547886c6cbbe1d0582f6cb0d2cb14e"
         ),
         //AUTO_GENERATE_TARGETS_END//
     ]
