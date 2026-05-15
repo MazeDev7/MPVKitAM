@@ -139,38 +139,38 @@ let package = Package(
 
         .binaryTarget(
             name: "Libavcodec",
-            url: "https://github.com/edde746/MPVKit/releases/download/avfoundation-dv-hdr-osd/Libavcodec.xcframework.zip",
-            checksum: "d994b529d1cd81bdd931ede930b9ce1ec524440659cba5f3e25eccc399a08c56"
+            url: "https://github.com/edde746/MPVKit/releases/download/avfoundation-timed-osd/Libavcodec.xcframework.zip",
+            checksum: "ffed3e0c752fb10ecc62aa5d59e92fd0c00a8eb0535e6daa3c40437ee1c8e55f"
         ),
         .binaryTarget(
             name: "Libavdevice",
-            url: "https://github.com/edde746/MPVKit/releases/download/avfoundation-dv-hdr-osd/Libavdevice.xcframework.zip",
-            checksum: "2f8117f28dd0e30786a225380c04931305bafca55b3730ff37b63454ef9a513c"
+            url: "https://github.com/edde746/MPVKit/releases/download/avfoundation-timed-osd/Libavdevice.xcframework.zip",
+            checksum: "04c66d5ac6bff0e8f6d12877f5b048c89b17188ece5e25ccee39582dea6d4521"
         ),
         .binaryTarget(
             name: "Libavformat",
-            url: "https://github.com/edde746/MPVKit/releases/download/avfoundation-dv-hdr-osd/Libavformat.xcframework.zip",
-            checksum: "73ded25262a5e2406e7347f20624779d46be93508aac6a86cbda05362016853e"
+            url: "https://github.com/edde746/MPVKit/releases/download/avfoundation-timed-osd/Libavformat.xcframework.zip",
+            checksum: "75ff3ad1aaee3970c83dcd604cf4d9aa8c4c58580182cb658d05b075ffbacf24"
         ),
         .binaryTarget(
             name: "Libavfilter",
-            url: "https://github.com/edde746/MPVKit/releases/download/avfoundation-dv-hdr-osd/Libavfilter.xcframework.zip",
-            checksum: "f1d8a88144f6e540df56399f1f4f20788487765bddae2fa86f7d59668c0f1077"
+            url: "https://github.com/edde746/MPVKit/releases/download/avfoundation-timed-osd/Libavfilter.xcframework.zip",
+            checksum: "4da69ab155f90a502c1183d962a5a18cef393d23c13ada31d7dd2a09c6cd6036"
         ),
         .binaryTarget(
             name: "Libavutil",
-            url: "https://github.com/edde746/MPVKit/releases/download/avfoundation-dv-hdr-osd/Libavutil.xcframework.zip",
-            checksum: "d0063b29f15a5f2932708e36b6f44314d19e26fae7a125d6c637f2ff609e8ad4"
+            url: "https://github.com/edde746/MPVKit/releases/download/avfoundation-timed-osd/Libavutil.xcframework.zip",
+            checksum: "67b928a2cf623c4d26e0acbef21ab88f6d7a84c23c7ad6e53f01609bd0429a60"
         ),
         .binaryTarget(
             name: "Libswresample",
-            url: "https://github.com/edde746/MPVKit/releases/download/avfoundation-dv-hdr-osd/Libswresample.xcframework.zip",
-            checksum: "06f08582e21a883b674500b64a858af72454519ac8a7ebf810e4bc51c95ec4a2"
+            url: "https://github.com/edde746/MPVKit/releases/download/avfoundation-timed-osd/Libswresample.xcframework.zip",
+            checksum: "4c676fc792d8b94773afdebd121eab581005621180561f675d359116d0b92ebc"
         ),
         .binaryTarget(
             name: "Libswscale",
-            url: "https://github.com/edde746/MPVKit/releases/download/avfoundation-dv-hdr-osd/Libswscale.xcframework.zip",
-            checksum: "687d18766ab89812bac84be9076cc84c1c986884471df6569f929655d947ef7a"
+            url: "https://github.com/edde746/MPVKit/releases/download/avfoundation-timed-osd/Libswscale.xcframework.zip",
+            checksum: "57c5c1397f3f289894fb2238d7dcd8ea584af0624c3a23abf5dea7d126c18555"
         ),
 
         .binaryTarget(
