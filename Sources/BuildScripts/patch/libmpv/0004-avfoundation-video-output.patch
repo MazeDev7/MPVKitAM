@@ -7,8 +7,8 @@ Subject: [PATCH] AVfoundation video output
  meson.build                 |   15 +
  meson.options               |    1 +
  video/out/vo.c              |    4 +
- video/out/vo_avfoundation.m | 1897 +++++++++++++++++++++++++++++++++++
- 4 files changed, 1917 insertions(+)
+ video/out/vo_avfoundation.m | 2419 +++++++++++++++++++++++++++++++++++
+ 4 files changed, 2439 insertions(+)
  create mode 100644 video/out/vo_avfoundation.m
 
 diff --git a/meson.build b/meson.build
@@ -77,7 +77,7 @@ new file mode 100644
 index 0000000000..1b3e13aece
 --- /dev/null
 +++ b/video/out/vo_avfoundation.m
-@@ -0,0 +1,1897 @@
+@@ -0,0 +1,2419 @@
 +/*
 + * This file is part of mpv.
 + *
@@ -100,6 +100,7 @@ index 0000000000..1b3e13aece
 +#include <libavutil/hwcontext.h>
 +#include <libavutil/hwcontext_videotoolbox.h>
 +#include "common/common.h"
++#include "options/m_config.h"
 +#include "options/m_option.h"
 +#include "osdep/timer.h"
 +#include "vo.h"
@@ -134,8 +135,16 @@ index 0000000000..1b3e13aece
 +    AVF_OSD_DRAW_COREGRAPHICS,
 +};
 +
++struct avfoundation_opts {
++    bool composite_osd;
++    bool pip_composite_osd;
++    int queue_lead_ms;
++};
++
 +struct priv {
 +    struct mp_hwdec_ctx hwctx;
++    struct m_config_cache *opts_cache;
++    struct avfoundation_opts *opts;
 +
 +    struct mp_image *next_image;
 +    double next_pts;
@@ -157,13 +166,14 @@ index 0000000000..1b3e13aece
 +    bool osd_needs_enqueue;
 +
 +    // Compositing mode support
-+    bool composite_osd;
 +    __strong id<MTLDevice> mtlDevice;
 +    __strong CIContext *ciContext;
 +    CVPixelBufferPoolRef outputPool;
 +    int output_pool_w, output_pool_h;
++    OSType output_pool_format;
 +    CGImageRef cachedSubtitleImage;
 +    CVPixelBufferRef cachedSubtitleBuffer;
++    int subtitle_x0, subtitle_y0, subtitle_x1, subtitle_y1;
 +    bool has_subtitle;
 +
 +    // Software frame upload support
@@ -173,7 +183,6 @@ index 0000000000..1b3e13aece
 +
 +    // Frame counter for periodic maintenance
 +    int frame_count;
-+    int queue_lead_ms;
 +    int not_ready_drop_count;
 +    int64_t last_not_ready_drop_ns;
 +    int64_t last_display_recovery_ns;
@@ -202,6 +211,42 @@ index 0000000000..1b3e13aece
 +}
 +
 +static void dispatch_main_sync_safe(dispatch_block_t block);
++static void clear_subtitle_cache(struct priv *p);
++static void release_ci_compositor(struct priv *p);
++static const struct m_sub_options avfoundation_conf;
++
++static bool should_composite_into_video(struct priv *p)
++{
++    return p->opts && (p->opts->composite_osd || p->opts->pip_composite_osd);
++}
++
++static bool should_use_inline_osd_layer(struct priv *p)
++{
++    return !should_composite_into_video(p);
++}
++
++static bool is_p010_format(OSType format)
++{
++    return format == kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange ||
++           format == kCVPixelFormatType_420YpCbCr10BiPlanarFullRange;
++}
++
++static bool is_nv12_format(OSType format)
++{
++    return format == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange ||
++           format == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange;
++}
++
++static bool is_biplanar_yuv_format(OSType format)
++{
++    return is_nv12_format(format) || is_p010_format(format);
++}
++
++static bool is_full_range_yuv_format(OSType format)
++{
++    return format == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange ||
++           format == kCVPixelFormatType_420YpCbCr10BiPlanarFullRange;
++}
 +
 +static id<AVQueuedSampleBufferRendering> active_sample_buffer_renderer(
 +    AVSampleBufferDisplayLayer *displayLayer)
@@ -543,7 +588,7 @@ index 0000000000..1b3e13aece
 +    if (frame_h <= 0)
 +        frame_h = vo->params ? vo->params->h : 0;
 +
-+    if (!p->composite_osd) {
++    if (should_use_inline_osd_layer(p)) {
 +        return (struct avf_render_geometry){
 +            .w = vo_osd.w,
 +            .h = vo_osd.h,
@@ -612,7 +657,7 @@ index 0000000000..1b3e13aece
 +    update_avfoundation_geometry(vo);
 +    invalidate_render_geometry(vo);
 +
-+    if (p->composite_osd || !p->osdLayer || !p->displayLayer)
++    if (!should_use_inline_osd_layer(p) || !p->osdLayer || !p->displayLayer)
 +        return;
 +    AVSampleBufferDisplayLayer *osdLayer = [p->osdLayer retain];
 +    AVSampleBufferDisplayLayer *displayLayer = [p->displayLayer retain];
@@ -636,6 +681,45 @@ index 0000000000..1b3e13aece
 +        [osdLayer release];
 +        [displayLayer release];
 +    });
++}
++
++static void avfoundation_opts_wakeup(void *ctx)
++{
++    vo_wakeup(ctx);
++}
++
++static void update_avfoundation_options(struct vo *vo)
++{
++    struct priv *p = vo->priv;
++
++    if (!p->opts_cache || !p->opts)
++        return;
++
++    bool old_composite_osd = p->opts->composite_osd;
++    bool old_pip_composite_osd = p->opts->pip_composite_osd;
++    int old_queue_lead_ms = p->opts->queue_lead_ms;
++
++    if (!m_config_cache_update(p->opts_cache))
++        return;
++
++    if (old_queue_lead_ms != p->opts->queue_lead_ms)
++        vo_set_queue_params(vo, MP_TIME_MS_TO_NS(p->opts->queue_lead_ms), 1);
++
++    if (old_composite_osd == p->opts->composite_osd &&
++        old_pip_composite_osd == p->opts->pip_composite_osd)
++        return;
++
++    MP_VERBOSE(vo, "OSD compositing updated: composite_osd: %s, "
++               "pip_composite_osd: %s\n",
++               p->opts->composite_osd ? "yes" : "no",
++               p->opts->pip_composite_osd ? "yes" : "no");
++
++    clear_subtitle_cache(p);
++    if (!should_composite_into_video(p))
++        release_ci_compositor(p);
++    if (p->osdLayer)
++        sample_buffer_renderer_flush(p->osdLayer, true);
++    sync_osd_layer_frame(vo);
 +}
 +
 +static bool wait_until_ready_for_more_media_data(struct vo *vo, int64_t present_host_ns)
@@ -752,34 +836,21 @@ index 0000000000..1b3e13aece
 +}
 +
 +
-+// Create output pool matching the source format to preserve quality
-+// Strategy: Use BGRA for 8-bit SDR (matches subtitle format, avoids half-float precision loss)
-+//           Use RGBA half-float for 10-bit HDR (necessary for HDR precision)
-+static bool create_output_pool(struct vo *vo, int w, int h, OSType format)
++static OSType ci_output_format_for_source(OSType format)
++{
++    if (format == kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange ||
++        format == kCVPixelFormatType_420YpCbCr10BiPlanarFullRange)
++        return kCVPixelFormatType_64RGBAHalf;
++    return kCVPixelFormatType_32BGRA;
++}
++
++static bool create_output_pool(struct vo *vo, int w, int h, OSType outputFormat)
 +{
 +    struct priv *p = vo->priv;
 +
-+    OSType outputFormat;
-+
-+    // For 10-bit HDR content (P010), use RGBA half-float to preserve HDR precision
-+    if (format == kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange ||
-+        format == kCVPixelFormatType_420YpCbCr10BiPlanarFullRange) {
-+        outputFormat = kCVPixelFormatType_64RGBAHalf;
-+    }
-+    // For 8-bit SDR content, use BGRA (matches subtitle format, avoids half-float precision issues)
-+    // This minimizes format conversions and preserves quality better than RGBA half-float
-+    else if (format == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange ||
-+             format == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange ||
-+             format == kCVPixelFormatType_420YpCbCr8Planar) {
-+        outputFormat = kCVPixelFormatType_32BGRA;
-+    }
-+    // Default to RGBA half-float for unknown formats (HDR-safe fallback)
-+    else {
-+        outputFormat = kCVPixelFormatType_64RGBAHalf;
-+    }
-+
 +    return create_pixel_buffer_pool(vo, &p->outputPool, &p->output_pool_w,
-+        &p->output_pool_h, NULL, w, h, outputFormat, "composite output");
++        &p->output_pool_h, &p->output_pool_format, w, h, outputFormat,
++        "composite output");
 +}
 +
 +static CFStringRef get_cv_color_primaries(enum pl_color_primaries primaries)
@@ -866,25 +937,122 @@ index 0000000000..1b3e13aece
 +        set_colorspace_from_attachments(pixbuf);
 +}
 +
-+// Copy HDR metadata from source to destination pixel buffer
-+static void copy_hdr_metadata(CVPixelBufferRef src, CVPixelBufferRef dst)
++static void copy_pixel_buffer_metadata(CVPixelBufferRef src, CVPixelBufferRef dst,
++                                       OSType dst_format)
 +{
-+    const CFStringRef keys[] = {
-+        kCVImageBufferTransferFunctionKey,      // PQ for HDR10/DolbyVision, HLG for HLG
-+        kCVImageBufferColorPrimariesKey,        // BT.2020 for HDR
-+        kCVImageBufferYCbCrMatrixKey,
-+        kCVImageBufferMasteringDisplayColorVolumeKey,  // HDR10 static metadata
-+        kCVImageBufferContentLightLevelInfoKey,        // MaxCLL, MaxFALL
-+    };
++    CVBufferPropagateAttachments(src, dst);
++    if (!is_biplanar_yuv_format(dst_format))
++        CVBufferRemoveAttachment(dst, kCVImageBufferYCbCrMatrixKey);
++    set_colorspace_from_attachments(dst);
++}
 +
-+    for (size_t i = 0; i < MP_ARRAY_SIZE(keys); i++) {
-+        CFTypeRef value = CVBufferGetAttachment(src, keys[i], NULL);
-+        if (value) {
-+            CVBufferSetAttachment(dst, keys[i], value, kCVAttachmentMode_ShouldPropagate);
++static void get_yuv_coefficients(CVPixelBufferRef pixbuf, double *kr, double *kb)
++{
++    *kr = 0.2126;
++    *kb = 0.0722;
++
++    CFTypeRef matrix = CVBufferGetAttachment(pixbuf, kCVImageBufferYCbCrMatrixKey, NULL);
++    if (!matrix)
++        return;
++
++    if (CFEqual(matrix, kCVImageBufferYCbCrMatrix_ITU_R_2020)) {
++        *kr = 0.2627;
++        *kb = 0.0593;
++    } else if (CFEqual(matrix, kCVImageBufferYCbCrMatrix_ITU_R_601_4)) {
++        *kr = 0.299;
++        *kb = 0.114;
++    }
++}
++
++static bool copy_pixel_buffer_planes(CVPixelBufferRef src, CVPixelBufferRef dst)
++{
++    CVReturn src_status = CVPixelBufferLockBaseAddress(src, kCVPixelBufferLock_ReadOnly);
++    if (src_status != kCVReturnSuccess)
++        return false;
++
++    CVReturn dst_status = CVPixelBufferLockBaseAddress(dst, 0);
++    if (dst_status != kCVReturnSuccess) {
++        CVPixelBufferUnlockBaseAddress(src, kCVPixelBufferLock_ReadOnly);
++        return false;
++    }
++
++    size_t planes = CVPixelBufferGetPlaneCount(src);
++    bool ok = planes == CVPixelBufferGetPlaneCount(dst);
++    if (ok && planes > 0) {
++        for (size_t plane = 0; plane < planes; plane++) {
++            uint8_t *src_base = CVPixelBufferGetBaseAddressOfPlane(src, plane);
++            uint8_t *dst_base = CVPixelBufferGetBaseAddressOfPlane(dst, plane);
++            size_t src_stride = CVPixelBufferGetBytesPerRowOfPlane(src, plane);
++            size_t dst_stride = CVPixelBufferGetBytesPerRowOfPlane(dst, plane);
++            size_t height = MPMIN(CVPixelBufferGetHeightOfPlane(src, plane),
++                                  CVPixelBufferGetHeightOfPlane(dst, plane));
++            size_t bytes = MPMIN(src_stride, dst_stride);
++            if (!src_base || !dst_base) {
++                ok = false;
++                break;
++            }
++            for (size_t y = 0; y < height; y++)
++                memcpy(dst_base + y * dst_stride, src_base + y * src_stride, bytes);
++        }
++    } else if (ok) {
++        uint8_t *src_base = CVPixelBufferGetBaseAddress(src);
++        uint8_t *dst_base = CVPixelBufferGetBaseAddress(dst);
++        size_t src_stride = CVPixelBufferGetBytesPerRow(src);
++        size_t dst_stride = CVPixelBufferGetBytesPerRow(dst);
++        size_t height = MPMIN(CVPixelBufferGetHeight(src), CVPixelBufferGetHeight(dst));
++        size_t bytes = MPMIN(src_stride, dst_stride);
++        ok = src_base && dst_base;
++        if (ok) {
++            for (size_t y = 0; y < height; y++)
++                memcpy(dst_base + y * dst_stride, src_base + y * src_stride, bytes);
 +        }
 +    }
 +
-+    set_colorspace_from_attachments(dst);
++    CVPixelBufferUnlockBaseAddress(dst, 0);
++    CVPixelBufferUnlockBaseAddress(src, kCVPixelBufferLock_ReadOnly);
++    return ok;
++}
++
++static int clip_u8(double value)
++{
++    return MPCLAMP((int)(value + 0.5), 0, 255);
++}
++
++static int clip_u10(double value)
++{
++    return MPCLAMP((int)(value + 0.5), 0, 1023);
++}
++
++static void update_subtitle_bounds(struct priv *p, CVPixelBufferRef subtitle)
++{
++    p->subtitle_x0 = p->osd_w;
++    p->subtitle_y0 = p->osd_h;
++    p->subtitle_x1 = 0;
++    p->subtitle_y1 = 0;
++
++    if (!subtitle || p->osd_w <= 0 || p->osd_h <= 0)
++        return;
++
++    if (CVPixelBufferLockBaseAddress(subtitle, kCVPixelBufferLock_ReadOnly) != kCVReturnSuccess)
++        return;
++
++    uint8_t *base = CVPixelBufferGetBaseAddress(subtitle);
++    size_t stride = CVPixelBufferGetBytesPerRow(subtitle);
++    if (base && stride) {
++        for (int y = 0; y < p->osd_h; y++) {
++            uint8_t *row = base + (size_t)y * stride;
++            for (int x = 0; x < p->osd_w; x++) {
++                if (row[(size_t)x * 4 + 3]) {
++                    p->subtitle_x0 = MPMIN(p->subtitle_x0, x);
++                    p->subtitle_y0 = MPMIN(p->subtitle_y0, y);
++                    p->subtitle_x1 = MPMAX(p->subtitle_x1, x + 1);
++                    p->subtitle_y1 = MPMAX(p->subtitle_y1, y + 1);
++                }
++            }
++        }
++    }
++
++    CVPixelBufferUnlockBaseAddress(subtitle, kCVPixelBufferLock_ReadOnly);
 +}
 +
 +// Map mpv image format to CVPixelBuffer format
@@ -1348,7 +1516,7 @@ index 0000000000..1b3e13aece
 +    if (needed)
 +        *needed = false;
 +
-+    if (p->composite_osd || !p->osd_needs_enqueue)
++    if (!should_use_inline_osd_layer(p) || !p->osd_needs_enqueue)
 +        return NULL;
 +
 +    if (needed)
@@ -1432,7 +1600,7 @@ index 0000000000..1b3e13aece
 +                CVPixelBufferRelease(p->cachedSubtitleBuffer);
 +                p->cachedSubtitleBuffer = NULL;
 +            }
-+            if (!p->composite_osd)
++            if (should_use_inline_osd_layer(p))
 +                p->osd_needs_enqueue = true;
 +        }
 +        return;
@@ -1440,35 +1608,46 @@ index 0000000000..1b3e13aece
 +
 +    // Skip redraw if content hasn't changed AND we already have a subtitle cached
 +    // This prevents unnecessary re-rendering but ensures we don't skip first render
-+    bool has_cached_subtitle = p->composite_osd
-+        ? p->cachedSubtitleImage != NULL
-+        : p->cachedSubtitleBuffer != NULL;
++    bool need_image = should_composite_into_video(p);
++    bool need_buffer = should_use_inline_osd_layer(p) || should_composite_into_video(p);
++    bool has_cached_subtitle = (!need_image || p->cachedSubtitleImage) &&
++        (!need_buffer || p->cachedSubtitleBuffer);
 +    if (imgs->change_id != 0 && imgs->change_id == p->osd_change_id &&
 +        p->has_subtitle && has_cached_subtitle) {
 +        return;
 +    }
 +
-+    if (p->composite_osd) {
++    bool rendered = false;
++    if (need_image) {
 +        CGImageRef subtitleImage = render_subtitle_image(vo, imgs);
-+        if (!subtitleImage)
-+            return;
-+
-+        if (p->cachedSubtitleImage)
-+            CGImageRelease(p->cachedSubtitleImage);
-+        p->cachedSubtitleImage = subtitleImage;
-+    } else {
-+        CVPixelBufferRef subtitleBuffer = render_subtitle_pixel_buffer(vo, imgs);
-+        if (!subtitleBuffer)
-+            return;
-+
-+        if (p->cachedSubtitleBuffer)
-+            CVPixelBufferRelease(p->cachedSubtitleBuffer);
-+        p->cachedSubtitleBuffer = subtitleBuffer;
++        if (subtitleImage) {
++            if (p->cachedSubtitleImage)
++                CGImageRelease(p->cachedSubtitleImage);
++            p->cachedSubtitleImage = subtitleImage;
++            rendered = true;
++        }
 +    }
++
++    if (need_buffer) {
++        CVPixelBufferRef subtitleBuffer = render_subtitle_pixel_buffer(vo, imgs);
++        if (!subtitleBuffer && !rendered)
++            return;
++
++        if (subtitleBuffer) {
++            if (p->cachedSubtitleBuffer)
++                CVPixelBufferRelease(p->cachedSubtitleBuffer);
++            p->cachedSubtitleBuffer = subtitleBuffer;
++            update_subtitle_bounds(p, subtitleBuffer);
++            rendered = true;
++        }
++    }
++
++    if (!rendered)
++        return;
 +
 +    p->osd_change_id = imgs->change_id;
 +    p->has_subtitle = true;
-+    if (!p->composite_osd)
++    if (should_use_inline_osd_layer(p))
 +        p->osd_needs_enqueue = true;
 +}
 +
@@ -1481,8 +1660,8 @@ index 0000000000..1b3e13aece
 +    if (!vo->osd)
 +        return false;
 +
-+    // In composite mode, we don't need the osdLayer
-+    if (!p->composite_osd && !p->osdLayer)
++    // In compositing modes, we don't need the inline OSD layer.
++    if (!should_composite_into_video(p) && !p->osdLayer)
 +        return false;
 +
 +    struct mp_osd_res osd_res = geometry.osd_res;
@@ -1520,7 +1699,7 @@ index 0000000000..1b3e13aece
 +            CVPixelBufferRelease(p->cachedSubtitleBuffer);
 +            p->cachedSubtitleBuffer = NULL;
 +        }
-+        if (!p->composite_osd)
++        if (should_use_inline_osd_layer(p))
 +            p->osd_needs_enqueue = true;
 +    }
 +
@@ -1538,12 +1717,194 @@ index 0000000000..1b3e13aece
 +    render_osd_with_geometry(vo, pts, geometry);
 +}
 +
++static bool ensure_ci_compositor(struct vo *vo)
++{
++    struct priv *p = vo->priv;
++
++    if (p->ciContext)
++        return true;
++
++    p->mtlDevice = MTLCreateSystemDefaultDevice();
++    if (!p->mtlDevice) {
++        MP_ERR(vo, "Failed to create Metal device\n");
++        return false;
++    }
++
++    NSDictionary *ciOptions = @{
++        kCIContextHighQualityDownsample: @NO,
++        kCIContextUseSoftwareRenderer: @NO
++    };
++    p->ciContext = [[CIContext contextWithMTLDevice:p->mtlDevice options:ciOptions] retain];
++    if (!p->ciContext) {
++        MP_ERR(vo, "Failed to create CIContext\n");
++        [p->mtlDevice release];
++        p->mtlDevice = nil;
++        return false;
++    }
++
++    return true;
++}
++
++static void release_ci_compositor(struct priv *p)
++{
++    [p->ciContext release];
++    p->ciContext = nil;
++    [p->mtlDevice release];
++    p->mtlDevice = nil;
++}
++
++static CVPixelBufferRef composite_yuv_frame(struct vo *vo, CVPixelBufferRef videoBuffer,
++                                           OSType sourceFormat)
++{
++    struct priv *p = vo->priv;
++
++    if (!p->cachedSubtitleBuffer || p->subtitle_x1 <= p->subtitle_x0 ||
++        p->subtitle_y1 <= p->subtitle_y0)
++        return NULL;
++
++    int videoW = (int)CVPixelBufferGetWidth(videoBuffer);
++    int videoH = (int)CVPixelBufferGetHeight(videoBuffer);
++    if (videoW <= 0 || videoH <= 0)
++        return NULL;
++
++    if (!create_output_pool(vo, videoW, videoH, sourceFormat))
++        return NULL;
++
++    CVPixelBufferRef outputBuffer = NULL;
++    CVReturn status = CVPixelBufferPoolCreatePixelBuffer(
++        kCFAllocatorDefault, p->outputPool, &outputBuffer);
++    if (status != kCVReturnSuccess || !outputBuffer) {
++        MP_ERR(vo, "Failed to get YUV composite buffer: %d\n", status);
++        return NULL;
++    }
++
++    copy_pixel_buffer_metadata(videoBuffer, outputBuffer, sourceFormat);
++    if (!copy_pixel_buffer_planes(videoBuffer, outputBuffer)) {
++        CVPixelBufferRelease(outputBuffer);
++        return NULL;
++    }
++
++    if (CVPixelBufferLockBaseAddress(outputBuffer, 0) != kCVReturnSuccess) {
++        CVPixelBufferRelease(outputBuffer);
++        return NULL;
++    }
++    if (CVPixelBufferLockBaseAddress(p->cachedSubtitleBuffer,
++                                     kCVPixelBufferLock_ReadOnly) != kCVReturnSuccess) {
++        CVPixelBufferUnlockBaseAddress(outputBuffer, 0);
++        CVPixelBufferRelease(outputBuffer);
++        return NULL;
++    }
++
++    uint8_t *subBase = CVPixelBufferGetBaseAddress(p->cachedSubtitleBuffer);
++    size_t subStride = CVPixelBufferGetBytesPerRow(p->cachedSubtitleBuffer);
++    int subW = (int)CVPixelBufferGetWidth(p->cachedSubtitleBuffer);
++    int subH = (int)CVPixelBufferGetHeight(p->cachedSubtitleBuffer);
++    uint8_t *yBase = CVPixelBufferGetBaseAddressOfPlane(outputBuffer, 0);
++    uint8_t *uvBase = CVPixelBufferGetBaseAddressOfPlane(outputBuffer, 1);
++    size_t yStride = CVPixelBufferGetBytesPerRowOfPlane(outputBuffer, 0);
++    size_t uvStride = CVPixelBufferGetBytesPerRowOfPlane(outputBuffer, 1);
++
++    if (!subBase || !subStride || subW <= 0 || subH <= 0 || !yBase || !uvBase) {
++        CVPixelBufferUnlockBaseAddress(p->cachedSubtitleBuffer, kCVPixelBufferLock_ReadOnly);
++        CVPixelBufferUnlockBaseAddress(outputBuffer, 0);
++        CVPixelBufferRelease(outputBuffer);
++        return NULL;
++    }
++
++    double kr, kb;
++    get_yuv_coefficients(videoBuffer, &kr, &kb);
++    double kg = 1.0 - kr - kb;
++    bool fullRange = is_full_range_yuv_format(sourceFormat);
++    bool p010 = is_p010_format(sourceFormat);
++
++    double yOffset = fullRange ? 0.0 : (p010 ? 64.0 : 16.0);
++    double yRange = fullRange ? (p010 ? 1023.0 : 255.0) : (p010 ? 876.0 : 219.0);
++    double cCenter = p010 ? 512.0 : 128.0;
++    double cRange = fullRange ? (p010 ? 1023.0 : 255.0) : (p010 ? 896.0 : 224.0);
++
++    int vx0 = MPCLAMP((p->subtitle_x0 * videoW) / subW - 1, 0, videoW);
++    int vy0 = MPCLAMP((p->subtitle_y0 * videoH) / subH - 1, 0, videoH);
++    int vx1 = MPCLAMP(((p->subtitle_x1 * videoW) + subW - 1) / subW + 1, 0, videoW);
++    int vy1 = MPCLAMP(((p->subtitle_y1 * videoH) + subH - 1) / subH + 1, 0, videoH);
++
++    for (int y = vy0; y < vy1; y++) {
++        int sy = MPCLAMP((int)((int64_t)y * subH / videoH), 0, subH - 1);
++        uint8_t *subRow = subBase + (size_t)sy * subStride;
++        if (p010) {
++            uint16_t *yRow = (uint16_t *)(yBase + (size_t)y * yStride);
++            uint16_t *uvRow = (uint16_t *)(uvBase + (size_t)(y / 2) * uvStride);
++            for (int x = vx0; x < vx1; x++) {
++                int sx = MPCLAMP((int)((int64_t)x * subW / videoW), 0, subW - 1);
++                uint8_t *sp = subRow + (size_t)sx * 4;
++                double alpha = sp[3] / 255.0;
++                if (alpha <= 0.0)
++                    continue;
++
++                double b = sp[0] / 255.0;
++                double g = sp[1] / 255.0;
++                double r = sp[2] / 255.0;
++                double py = kr * r + kg * g + kb * b;
++                double oldY = yRow[x] >> 6;
++                yRow[x] = (uint16_t)(clip_u10(oldY * (1.0 - alpha) + yOffset * alpha + yRange * py) << 6);
++
++                if ((x & 1) == 0 && (y & 1) == 0) {
++                    double pu = (b - py) / (2.0 * (1.0 - kb));
++                    double pv = (r - py) / (2.0 * (1.0 - kr));
++                    int uvx = (x / 2) * 2;
++                    double oldU = uvRow[uvx] >> 6;
++                    double oldV = uvRow[uvx + 1] >> 6;
++                    uvRow[uvx] = (uint16_t)(clip_u10(oldU * (1.0 - alpha) + cCenter * alpha + cRange * pu) << 6);
++                    uvRow[uvx + 1] = (uint16_t)(clip_u10(oldV * (1.0 - alpha) + cCenter * alpha + cRange * pv) << 6);
++                }
++            }
++        } else {
++            uint8_t *yRow = yBase + (size_t)y * yStride;
++            uint8_t *uvRow = uvBase + (size_t)(y / 2) * uvStride;
++            for (int x = vx0; x < vx1; x++) {
++                int sx = MPCLAMP((int)((int64_t)x * subW / videoW), 0, subW - 1);
++                uint8_t *sp = subRow + (size_t)sx * 4;
++                double alpha = sp[3] / 255.0;
++                if (alpha <= 0.0)
++                    continue;
++
++                double b = sp[0] / 255.0;
++                double g = sp[1] / 255.0;
++                double r = sp[2] / 255.0;
++                double py = kr * r + kg * g + kb * b;
++                yRow[x] = (uint8_t)clip_u8(yRow[x] * (1.0 - alpha) + yOffset * alpha + yRange * py);
++
++                if ((x & 1) == 0 && (y & 1) == 0) {
++                    double pu = (b - py) / (2.0 * (1.0 - kb));
++                    double pv = (r - py) / (2.0 * (1.0 - kr));
++                    int uvx = (x / 2) * 2;
++                    uvRow[uvx] = (uint8_t)clip_u8(uvRow[uvx] * (1.0 - alpha) + cCenter * alpha + cRange * pu);
++                    uvRow[uvx + 1] = (uint8_t)clip_u8(uvRow[uvx + 1] * (1.0 - alpha) + cCenter * alpha + cRange * pv);
++                }
++            }
++        }
++    }
++
++    CVPixelBufferUnlockBaseAddress(p->cachedSubtitleBuffer, kCVPixelBufferLock_ReadOnly);
++    CVPixelBufferUnlockBaseAddress(outputBuffer, 0);
++    return outputBuffer;
++}
++
 +// Composite subtitle onto video frame using Core Image (GPU) - HDR compatible
 +static CVPixelBufferRef composite_frame(struct vo *vo, CVPixelBufferRef videoBuffer)
 +{
 +    struct priv *p = vo->priv;
 +
-+    if (!p->cachedSubtitleImage || !p->has_subtitle)
++    if (!p->has_subtitle)
++        return NULL;
++
++    OSType sourceFormat = CVPixelBufferGetPixelFormatType(videoBuffer);
++    if (is_biplanar_yuv_format(sourceFormat)) {
++        CVPixelBufferRef composited = composite_yuv_frame(vo, videoBuffer, sourceFormat);
++        if (composited)
++            return composited;
++    }
++
++    if (!p->cachedSubtitleImage || !ensure_ci_compositor(vo))
 +        return NULL;
 +
 +    size_t videoW = CVPixelBufferGetWidth(videoBuffer);
@@ -1562,11 +1923,10 @@ index 0000000000..1b3e13aece
 +
 +    CGRect outputRect = CGRectMake(0, 0, outW, outH);
 +
-+    // Detect original pixel format to preserve quality
-+    OSType sourceFormat = CVPixelBufferGetPixelFormatType(videoBuffer);
++    OSType outputFormat = ci_output_format_for_source(sourceFormat);
 +
 +    // Ensure output pool matches dimensions and format
-+    if (!create_output_pool(vo, (int)outW, (int)outH, sourceFormat))
++    if (!create_output_pool(vo, (int)outW, (int)outH, outputFormat))
 +        return NULL;
 +
 +    // Get output buffer from pool
@@ -1579,8 +1939,7 @@ index 0000000000..1b3e13aece
 +        return NULL;
 +    }
 +
-+    // Copy HDR metadata from input to output buffer BEFORE rendering
-+    copy_hdr_metadata(videoBuffer, outputBuffer);
++    copy_pixel_buffer_metadata(videoBuffer, outputBuffer, outputFormat);
 +
 +    // Use autoreleasepool to ensure CIImage objects are released promptly
 +    @autoreleasepool {
@@ -1667,6 +2026,10 @@ index 0000000000..1b3e13aece
 +{
 +    struct priv *p = vo->priv;
 +
++    p->opts_cache = m_config_cache_alloc(p, vo->global, &avfoundation_conf);
++    p->opts = p->opts_cache->opts;
++    m_config_cache_set_wakeup_cb(p->opts_cache, avfoundation_opts_wakeup, vo);
++
 +    if (vo->opts->WinID == -1) {
 +        MP_ERR(vo, "No AVSampleBufferDisplayLayer provided via --wid\n");
 +        return -1;
@@ -1674,8 +2037,9 @@ index 0000000000..1b3e13aece
 +
 +    p->displayLayer = [(__bridge AVSampleBufferDisplayLayer *)(intptr_t)(vo->opts->WinID) retain];
 +
-+    MP_VERBOSE(vo, "displayLayer: %p, composite_osd: %s\n",
-+               p->displayLayer, p->composite_osd ? "yes" : "no");
++    MP_VERBOSE(vo, "displayLayer: %p, composite_osd: %s, pip_composite_osd: %s\n",
++               p->displayLayer, p->opts->composite_osd ? "yes" : "no",
++               p->opts->pip_composite_osd ? "yes" : "no");
 +
 +    if (CMTimebaseCreateWithSourceClock(kCFAllocatorDefault,
 +                                        CMClockGetHostTimeClock(),
@@ -1695,80 +2059,41 @@ index 0000000000..1b3e13aece
 +        displayLayer.controlTimebase = timebase;
 +    });
 +    [displayLayer release];
-+    vo_set_queue_params(vo, (int64_t)p->queue_lead_ms * 1000 * 1000, 1);
++    vo_set_queue_params(vo, MP_TIME_MS_TO_NS(p->opts->queue_lead_ms), 1);
 +    update_avfoundation_geometry(vo);
 +
-+    // Setup Metal and Core Image for compositing mode (HDR-compatible)
-+    if (p->composite_osd) {
-+        p->mtlDevice = MTLCreateSystemDefaultDevice();
-+        if (!p->mtlDevice) {
-+            MP_ERR(vo, "Failed to create Metal device\n");
-+            return -1;
-+        }
-+
-+        // Use extended linear Display P3 color space for HDR compositing
-+        // This color space can represent values > 1.0 needed for HDR
-+        CGColorSpaceRef workingColorSpace = CGColorSpaceCreateWithName(
-+            kCGColorSpaceExtendedLinearDisplayP3);
-+        if (!workingColorSpace) {
-+            workingColorSpace = CGColorSpaceCreateWithName(kCGColorSpaceExtendedSRGB);
-+        }
-+        if (!workingColorSpace) {
-+            workingColorSpace = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
-+        }
-+
-+        NSDictionary *ciOptions = workingColorSpace ? @{
-+            kCIContextWorkingColorSpace: (__bridge id)workingColorSpace,
-+            kCIContextHighQualityDownsample: @NO,
-+            kCIContextUseSoftwareRenderer: @NO
-+        } : @{
-+            kCIContextHighQualityDownsample: @NO,
-+            kCIContextUseSoftwareRenderer: @NO
-+        };
-+
-+        p->ciContext = [[CIContext contextWithMTLDevice:p->mtlDevice options:ciOptions] retain];
-+
-+        if (workingColorSpace)
-+            CGColorSpaceRelease(workingColorSpace);
-+
-+        if (!p->ciContext) {
-+            MP_ERR(vo, "Failed to create CIContext\n");
-+            return -1;
-+        }
-+
-+        MP_VERBOSE(vo, "HDR-compatible compositing mode enabled with Metal\n");
-+
-+    }
++    if (p->opts->composite_osd && !ensure_ci_compositor(vo))
++        MP_WARN(vo, "Core Image fallback compositor unavailable\n");
 +
 +    // Create a timed OSD sample-buffer layer only if not in composite mode.
-+    if (!p->composite_osd) {
-+        AVSampleBufferDisplayLayer *displayLayer = [p->displayLayer retain];
-+        CMTimebaseRef timebase = p->timebase;
++    if (!p->opts->composite_osd) {
++        AVSampleBufferDisplayLayer *osdDisplayLayer = [p->displayLayer retain];
++        CMTimebaseRef osdTimebase = p->timebase;
 +        dispatch_main_sync_safe(^{
 +            AVSampleBufferDisplayLayer *osdLayer = [[AVSampleBufferDisplayLayer alloc] init];
-+            osdLayer.frame = displayLayer.frame;
++            osdLayer.frame = osdDisplayLayer.frame;
 +            osdLayer.anchorPoint = CGPointMake(0.5, 0.5);
 +#if !TARGET_OS_IPHONE
 +            osdLayer.autoresizingMask = kCALayerWidthSizable | kCALayerHeightSizable;
 +#endif
-+            osdLayer.contentsScale = displayLayer.contentsScale > 0 ? displayLayer.contentsScale : get_screen_scale();
++            osdLayer.contentsScale = osdDisplayLayer.contentsScale > 0 ? osdDisplayLayer.contentsScale : get_screen_scale();
 +            osdLayer.backgroundColor = NULL;
 +            osdLayer.opaque = NO;
 +            osdLayer.videoGravity = AVLayerVideoGravityResize;
-+            osdLayer.controlTimebase = timebase;
++            osdLayer.controlTimebase = osdTimebase;
 +
-+            CALayer *parent = displayLayer.superlayer;
++            CALayer *parent = osdDisplayLayer.superlayer;
 +            if (parent) {
 +                [parent addSublayer:osdLayer];
-+                osdLayer.zPosition = displayLayer.zPosition + 1;
++                osdLayer.zPosition = osdDisplayLayer.zPosition + 1;
 +            } else {
-+                [displayLayer addSublayer:osdLayer];
-+                osdLayer.frame = displayLayer.bounds;
++                [osdDisplayLayer addSublayer:osdLayer];
++                osdLayer.frame = osdDisplayLayer.bounds;
 +                MP_WARN(vo, "displayLayer has no superlayer; OSD will degrade direct scanout\n");
 +            }
 +            p->osdLayer = osdLayer;
 +        });
-+        [displayLayer release];
++        [osdDisplayLayer release];
 +    }
 +
 +    vo->hwdec_devs = hwdec_devices_create();
@@ -1807,8 +2132,8 @@ index 0000000000..1b3e13aece
 +        CVPixelBufferRef finalBuffer = pixbuf;
 +        bool needsRelease = false;
 +
-+        // In composite mode, composite the subtitle image rendered for this flip.
-+        if (p->composite_osd) {
++        // In compositing modes, composite the subtitle rendered for this flip.
++        if (should_composite_into_video(p)) {
 +            CVPixelBufferRef composited = composite_frame(vo, pixbuf);
 +            if (composited) {
 +                finalBuffer = composited;
@@ -1980,6 +2305,7 @@ index 0000000000..1b3e13aece
 +    p->osd_change_id = 0;
 +    p->osd_needs_enqueue = false;
 +    p->osd_callback_invoked = false;
++    p->subtitle_x0 = p->subtitle_y0 = p->subtitle_x1 = p->subtitle_y1 = 0;
 +}
 +
 +// Helper to clear all subtitle state (called on video change/stop)
@@ -1989,7 +2315,7 @@ index 0000000000..1b3e13aece
 +
 +    clear_subtitle_cache(p);
 +
-+    if (!p->composite_osd && p->osdLayer) {
++    if (p->osdLayer) {
 +        AVSampleBufferDisplayLayer *osdLayer = [p->osdLayer retain];
 +        if (!osdLayer)
 +            return;
@@ -2057,15 +2383,13 @@ index 0000000000..1b3e13aece
 +        p->swUploadPool = NULL;
 +    }
 +
-+    if (!p->composite_osd) {
-+        AVSampleBufferDisplayLayer *osdLayer = p->osdLayer;
-+        p->osdLayer = nil;
-+        if (osdLayer) {
-+            dispatch_main_sync_safe(^{
-+                [osdLayer removeFromSuperlayer];
-+            });
-+            [osdLayer release];
-+        }
++    AVSampleBufferDisplayLayer *osdLayer = p->osdLayer;
++    p->osdLayer = nil;
++    if (osdLayer) {
++        dispatch_main_sync_safe(^{
++            [osdLayer removeFromSuperlayer];
++        });
++        [osdLayer release];
 +    }
 +
 +    [p->ciContext release];
@@ -2076,6 +2400,10 @@ index 0000000000..1b3e13aece
 +    [p->displayLayer release];
 +    p->displayLayer = nil;
 +
++    talloc_free(p->opts_cache);
++    p->opts_cache = NULL;
++    p->opts = NULL;
++
 +    hwdec_devices_remove(vo->hwdec_devs, &p->hwctx);
 +    av_buffer_unref(&p->hwctx.av_device_ref);
 +}
@@ -2085,7 +2413,14 @@ index 0000000000..1b3e13aece
 +    struct priv *p = vo->priv;
 +
 +    switch (request) {
++    case VOCTRL_CHECK_EVENTS:
++        update_avfoundation_options(vo);
++        return VO_TRUE;
 +    case VOCTRL_VO_OPTS_CHANGED:
++        update_avfoundation_options(vo);
++        clear_subtitle_cache(p);
++        sync_osd_layer_frame(vo);
++        return VO_TRUE;
 +    case VOCTRL_SET_PANSCAN:
 +        clear_subtitle_cache(p);
 +        sync_osd_layer_frame(vo);
@@ -2125,10 +2460,26 @@ index 0000000000..1b3e13aece
 +
 +
 +#define OPT_BASE_STRUCT struct priv
-+static const struct m_option options[] = {
-+    {"composite-osd", OPT_BOOL(composite_osd)},
-+    {"queue-lead-ms", OPT_INT(queue_lead_ms), M_RANGE(0, 1000), OPTDEF_INT(128)},
++static const struct m_option priv_options[] = {
 +    {0},
++};
++
++#undef OPT_BASE_STRUCT
++#define OPT_BASE_STRUCT struct avfoundation_opts
++static const struct m_option avfoundation_options[] = {
++    {"composite-osd", OPT_BOOL(composite_osd)},
++    {"pip-composite-osd", OPT_BOOL(pip_composite_osd)},
++    {"queue-lead-ms", OPT_INT(queue_lead_ms), M_RANGE(0, 1000)},
++    {0},
++};
++
++static const struct m_sub_options avfoundation_conf = {
++    .prefix = "avfoundation",
++    .opts = avfoundation_options,
++    .size = sizeof(struct avfoundation_opts),
++    .defaults = &(const struct avfoundation_opts){
++        .queue_lead_ms = 128,
++    },
 +};
 +
 +const struct vo_driver video_out_avfoundation = {
@@ -2143,6 +2494,6 @@ index 0000000000..1b3e13aece
 +    .reconfig = reconfig,
 +    .uninit = uninit,
 +    .priv_size = sizeof(struct priv),
-+    .options = options,
-+    .options_prefix = "avfoundation",
++    .options = priv_options,
++    .global_opts = &avfoundation_conf,
 +};
