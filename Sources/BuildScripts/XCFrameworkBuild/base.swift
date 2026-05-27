@@ -50,6 +50,12 @@ class ArgumentOptions {
 
     static func parse(_ arguments: [String]) throws -> ArgumentOptions {
         let options = ArgumentOptions(arguments: Array(arguments.dropFirst()))
+        func appendPlatform(_ platform: PlatformType) {
+            if !options.platforms.contains(platform) {
+                options.platforms += [platform]
+            }
+        }
+
         for argument in arguments {
             switch argument {
             case "enable-debug":
@@ -67,14 +73,22 @@ class ArgumentOptions {
                         let platformStr = val.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
                         switch platformStr {
                         case "ios":
-                            options.platforms += [PlatformType.ios, PlatformType.isimulator]
+                            appendPlatform(.ios)
+                            appendPlatform(.isimulator)
+                        case "ios-device", "iphoneos":
+                            appendPlatform(.ios)
+                        case "ios-simulator", "iossim", "isimulator":
+                            appendPlatform(.isimulator)
                         case "tvos":
-                            options.platforms += [PlatformType.tvos, PlatformType.tvsimulator]
+                            appendPlatform(.tvos)
+                            appendPlatform(.tvsimulator)
+                        case "tvos-device":
+                            appendPlatform(.tvos)
+                        case "tvos-simulator", "tvossim", "tvsimulator":
+                            appendPlatform(.tvsimulator)
                         default:
-                            guard let other = PlatformType(rawValue: platformStr) else { throw NSError(domain: "unknown platform: \(val)", code: 1) } 
-                            if !options.platforms.contains(other) {
-                                options.platforms += [other]
-                            }
+                            guard let other = PlatformType(rawValue: platformStr) else { throw NSError(domain: "unknown platform: \(val)", code: 1) }
+                            appendPlatform(other)
                         }
                     }
                 }

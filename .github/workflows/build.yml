@@ -79,11 +79,17 @@ jobs:
       matrix:
         include:
           - name: macos
-            platforms: macos,maccatalyst
-          - name: ios
-            platforms: ios
+            platforms: macos
+          - name: maccatalyst
+            platforms: maccatalyst
+          - name: iphoneos
+            platforms: ios-device
+          - name: iphonesimulator
+            platforms: ios-simulator
           - name: tvos
-            platforms: tvos
+            platforms: tvos-device
+          - name: tvsimulator
+            platforms: tvos-simulator
     steps:
       - uses: actions/checkout@v4
 
@@ -103,7 +109,6 @@ jobs:
           path: |
             ./dist/release/*.xcframework.zip
             ./dist/release/*.xcframework.checksum.txt
-            ./dist/release/*-all.zip
             ./dist/release/Package.swift
           if-no-files-found: error
 
@@ -185,19 +190,6 @@ jobs:
             (release_dir / f'{framework_name}.xcframework.checksum.txt').write_text(checksum + '\n', encoding='utf-8')
             print(f'Merged {zip_name} from {len(zip_parts)} platform artifacts')
 
-          grouped_all_zips = {}
-          for zip_path in partial_root.glob('*/*-all.zip'):
-            grouped_all_zips.setdefault(zip_path.name, []).append(zip_path)
-
-          for zip_name, zip_parts in sorted(grouped_all_zips.items()):
-            with tempfile.TemporaryDirectory() as tmp:
-              tmp_path = Path(tmp)
-              merged_dir = tmp_path / zip_name[:-len('.zip')]
-              merged_dir.mkdir()
-              for zip_part in sorted(zip_parts):
-                subprocess.run(['/usr/bin/unzip', '-q', str(zip_part.resolve()), '-d', str(merged_dir)], check=True)
-              subprocess.run(['/usr/bin/zip', '-qr', str((release_dir / zip_name).resolve()), './'], cwd=merged_dir, check=True)
-            print(f'Merged {zip_name} from {len(zip_parts)} platform artifacts')
           PY
 
       - name: Update Package.swift
