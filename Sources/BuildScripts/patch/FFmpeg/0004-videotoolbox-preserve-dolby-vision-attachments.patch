@@ -43,8 +43,8 @@ index df551d0..294fc4e 100644
 +    return videotoolbox_dovi_is_apple_hevc(videotoolbox_dovi_get_conf(avctx));
 +}
 +
- static int videotoolbox_dovi_needs_p81_conversion(const AVDOVIDecoderConfigurationRecord *dovi)
- {
-     return dovi && dovi->dv_profile == 7 &&
+ enum PlezyDoviConversionMode {
+     PLEZY_DOVI_AUTO,
+     PLEZY_DOVI_DISABLED,
 -- 
 2.50.1 (Apple Git-155)

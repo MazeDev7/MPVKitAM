@@ -113,9 +113,9 @@ index 294fc4e..374a3c7 100644
 +    CFRelease(colorspace);
 +}
 +
- static int videotoolbox_dovi_needs_p81_conversion(const AVDOVIDecoderConfigurationRecord *dovi)
- {
-     return dovi && dovi->dv_profile == 7 &&
+ enum PlezyDoviConversionMode {
+     PLEZY_DOVI_AUTO,
+     PLEZY_DOVI_DISABLED,
 @@ -940,6 +1017,20 @@ static CFDictionaryRef videotoolbox_decoder_config_create(CMVideoCodecType codec
                              kVTVideoDecoderSpecification_RequireHardwareAcceleratedVideoDecoder,
                           kCFBooleanTrue);
