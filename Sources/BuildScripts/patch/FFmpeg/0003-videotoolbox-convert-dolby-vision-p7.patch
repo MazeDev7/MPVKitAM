@@ -10,11 +10,12 @@ synthetic P8.1 dvvC atom so Apple can decode the compatible base layer
 through its native Dolby Vision path.
 
 The conversion mode is selected by PLEZY_DV_CONVERSION_MODE:
-auto/dv81 convert profile 7 to profile 8.1, hevc_strip/disabled keep
-profile 7 on the plain HEVC base-layer path.
+auto/dv81 convert profile 7 to profile 8.1, hevc_strip drops only
+profile 7 RPU/EL NALs on the plain HEVC path, and disabled keeps profile 7
+unchanged.
 ---
- libavcodec/videotoolbox.c | 167 ++++++++++++++++++++++++++++++++++++--
- 1 file changed, 163 insertions(+), 4 deletions(-)
+ libavcodec/videotoolbox.c | 175 ++++++++++++++++++++++++++++++++++++--
+ 1 file changed, 171 insertions(+), 4 deletions(-)
 
 diff --git a/libavcodec/videotoolbox.c b/libavcodec/videotoolbox.c
 index d2d3b7c..df551d0 100644
@@ -48,7 +49,7 @@ index d2d3b7c..df551d0 100644
      switch (dovi->dv_profile) {
      case 5:
          return 1;
-@@ -861,24 +864,99 @@ static int videotoolbox_dovi_is_apple_hevc(const AVDOVIDecoderConfigurationRecor
+@@ -861,24 +864,108 @@ static int videotoolbox_dovi_is_apple_hevc(const AVDOVIDecoderConfigurationRecor
      }
  }
  
@@ -108,6 +109,15 @@ index d2d3b7c..df551d0 100644
 +           (mode == PLEZY_DOVI_AUTO || mode == PLEZY_DOVI_DV81);
 +}
 +
++static int videotoolbox_dovi_needs_hevc_strip(const AVDOVIDecoderConfigurationRecord *dovi)
++{
++    enum PlezyDoviConversionMode mode = videotoolbox_dovi_conversion_mode();
++
++    return dovi && dovi->dv_profile == 7 &&
++           dovi->rpu_present_flag && dovi->bl_present_flag &&
++           mode == PLEZY_DOVI_HEVC_STRIP;
++}
++
 +static int videotoolbox_dovi_effective_profile(const AVDOVIDecoderConfigurationRecord *dovi)
 +{
 +    if (!dovi)
@@ -152,7 +162,7 @@ index d2d3b7c..df551d0 100644
  
      return CFDataCreate(kCFAllocatorDefault, buf, sizeof(buf));
  }
-@@ -930,7 +980,9 @@ static CFDictionaryRef videotoolbox_decoder_config_create(CMVideoCodecType codec
+@@ -930,7 +989,9 @@ static CFDictionaryRef videotoolbox_decoder_config_create(CMVideoCodecType codec
              dovi = videotoolbox_dovi_get_conf(avctx);
              dovi_data = videotoolbox_dovi_extradata_create(dovi);
              if (dovi_data)
@@ -163,7 +173,7 @@ index d2d3b7c..df551d0 100644
          }
          break;
  #if CONFIG_VP9_VIDEOTOOLBOX_HWACCEL
-@@ -987,14 +1071,40 @@ static int videotoolbox_start(AVCodecContext *avctx)
+@@ -987,14 +1080,40 @@ static int videotoolbox_start(AVCodecContext *avctx)
      case AV_CODEC_ID_HEVC :
          {
              const AVDOVIDecoderConfigurationRecord *dovi = videotoolbox_dovi_get_conf(avctx);
@@ -208,7 +218,7 @@ index d2d3b7c..df551d0 100644
 +                }
              }
          }
-@@ -1180,10 +1258,82 @@ static int videotoolbox_hevc_start_frame(AVCodecContext *avctx,
+@@ -1180,10 +1267,81 @@ static int videotoolbox_hevc_start_frame(AVCodecContext *avctx,
      return 0;
  }
  
@@ -261,9 +271,9 @@ index d2d3b7c..df551d0 100644
 +    return ret;
 +}
 +
-+static int videotoolbox_hevc_decode_dovi_p81_slice(AVCodecContext *avctx,
-+                                                   const uint8_t *buffer,
-+                                                   uint32_t size)
++static int videotoolbox_hevc_decode_dovi_slice(AVCodecContext *avctx,
++                                              const uint8_t *buffer,
++                                              uint32_t size)
 +{
 +    int nal_type;
 +
@@ -271,9 +281,7 @@ index d2d3b7c..df551d0 100644
 +        return videotoolbox_common_decode_slice(avctx, buffer, size);
 +
 +    nal_type = (buffer[0] >> 1) & 0x3f;
-+    if (nal_type == HEVC_NAL_UNSPEC62)
-+        return 0;
-+    if (nal_type == HEVC_NAL_UNSPEC63)
++    if (nal_type == HEVC_NAL_UNSPEC62 || nal_type == HEVC_NAL_UNSPEC63)
 +        return 0;
 +
 +    return videotoolbox_common_decode_slice(avctx, buffer, size);
@@ -285,8 +293,9 @@ index d2d3b7c..df551d0 100644
  {
 +    const AVDOVIDecoderConfigurationRecord *dovi = videotoolbox_dovi_get_conf(avctx);
 +
-+    if (videotoolbox_dovi_needs_p81_conversion(dovi))
-+        return videotoolbox_hevc_decode_dovi_p81_slice(avctx, buffer, size);
++    if (videotoolbox_dovi_needs_p81_conversion(dovi) ||
++        videotoolbox_dovi_needs_hevc_strip(dovi))
++        return videotoolbox_hevc_decode_dovi_slice(avctx, buffer, size);
 +
      return videotoolbox_common_decode_slice(avctx, buffer, size);
  }
