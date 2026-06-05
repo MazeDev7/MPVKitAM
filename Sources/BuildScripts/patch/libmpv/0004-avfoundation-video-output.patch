@@ -77,7 +77,7 @@ new file mode 100644
 index 0000000000..1b3e13aece
 --- /dev/null
 +++ b/video/out/vo_avfoundation.m
-@@ -0,0 +1,2700 @@
+@@ -0,0 +1,2756 @@
 +/*
 + * This file is part of mpv.
 + *
@@ -97,6 +97,7 @@ index 0000000000..1b3e13aece
 +
 +#include <math.h>
 +#include <stdlib.h>
++#include <stdatomic.h>
 +#include <libavutil/hwcontext.h>
 +#include <libavutil/hwcontext_videotoolbox.h>
 +#include "common/common.h"
@@ -205,6 +206,13 @@ index 0000000000..1b3e13aece
 +    // Avoid logging every frame if geometry rendering repeatedly fails.
 +    bool geometry_render_failure_logged;
 +
++    // App-active presentation resync (iOS/tvOS). The system suspends the
++    // autonomous AVSampleBufferDisplayLayer on resign-active without setting
++    // requiresFlushToResumeDecoding, so we force a layer recovery on resume.
++    id app_active_observer;
++    id app_resign_observer;
++    bool presentation_suspended;
++    atomic_bool pending_presentation_resync;
 +};
 +
 +static CGFloat get_screen_scale(void)
@@ -488,7 +496,7 @@ index 0000000000..1b3e13aece
 +           sample_buffer_renderer_requires_flush(displayLayer);
 +}
 +
-+static void recover_display_layer(struct vo *vo, const char *reason)
++static void recover_display_layer(struct vo *vo, const char *reason, bool force)
 +{
 +    struct priv *p = vo->priv;
 +    AVSampleBufferDisplayLayer *displayLayer = [p->displayLayer retain];
@@ -500,7 +508,7 @@ index 0000000000..1b3e13aece
 +    }
 +
 +    int64_t now = mp_time_ns();
-+    if (p->last_display_recovery_ns &&
++    if (!force && p->last_display_recovery_ns &&
 +        now - p->last_display_recovery_ns < MP_TIME_MS_TO_NS(500)) {
 +        [displayLayer release];
 +        [osdLayer release];
@@ -563,7 +571,7 @@ index 0000000000..1b3e13aece
 +    if (p->not_ready_drop_count >= 3 &&
 +        (!p->last_video_enqueue_ns ||
 +         now - p->last_video_enqueue_ns >= MP_TIME_MS_TO_NS(500)))
-+        recover_display_layer(vo, "repeated not-ready drops");
++        recover_display_layer(vo, "repeated not-ready drops", false);
 +}
 +
 +static void update_avfoundation_geometry(struct vo *vo)
@@ -745,7 +753,7 @@ index 0000000000..1b3e13aece
 +{
 +    struct priv *p = vo->priv;
 +    if (display_layer_needs_recovery(p->displayLayer))
-+        recover_display_layer(vo, "layer recovery request");
++        recover_display_layer(vo, "layer recovery request", false);
 +
 +    if (sample_buffer_renderer_is_ready(p->displayLayer)) {
 +        p->not_ready_drop_count = 0;
@@ -2344,6 +2352,31 @@ index 0000000000..1b3e13aece
 +    };
 +    hwdec_devices_add(vo->hwdec_devs, &p->hwctx);
 +
++    atomic_init(&p->pending_presentation_resync, false);
++#if TARGET_OS_IPHONE
++    dispatch_main_sync_safe(^{
++        NSNotificationCenter *nc = [NSNotificationCenter defaultCenter];
++        p->app_resign_observer = [[nc
++            addObserverForName:UIApplicationWillResignActiveNotification
++                        object:nil
++                         queue:[NSOperationQueue mainQueue]
++                    usingBlock:^(NSNotification *note) {
++            p->presentation_suspended = true;
++        }] retain];
++        p->app_active_observer = [[nc
++            addObserverForName:UIApplicationDidBecomeActiveNotification
++                        object:nil
++                         queue:[NSOperationQueue mainQueue]
++                    usingBlock:^(NSNotification *note) {
++            if (p->presentation_suspended) {
++                p->presentation_suspended = false;
++                atomic_store(&p->pending_presentation_resync, true);
++                vo_wakeup(vo);
++            }
++        }] retain];
++    });
++#endif
++
 +    return 0;
 +}
 +
@@ -2477,6 +2510,9 @@ index 0000000000..1b3e13aece
 +static void flip_page(struct vo *vo)
 +{
 +    struct priv *p = vo->priv;
++
++    if (atomic_exchange(&p->pending_presentation_resync, false))
++        recover_display_layer(vo, "presentation resume", true);
 +
 +    if (p->next_image) {
 +        CMSampleBufferRef osd_buf = NULL;
@@ -2620,6 +2656,24 @@ index 0000000000..1b3e13aece
 +{
 +    struct priv *p = vo->priv;
 +
++#if TARGET_OS_IPHONE
++    if (p->app_resign_observer || p->app_active_observer) {
++        dispatch_main_sync_safe(^{
++            NSNotificationCenter *nc = [NSNotificationCenter defaultCenter];
++            if (p->app_resign_observer) {
++                [nc removeObserver:p->app_resign_observer];
++                [p->app_resign_observer release];
++                p->app_resign_observer = nil;
++            }
++            if (p->app_active_observer) {
++                [nc removeObserver:p->app_active_observer];
++                [p->app_active_observer release];
++                p->app_active_observer = nil;
++            }
++        });
++    }
++#endif
++
 +    mp_image_unrefp(&p->next_image);
 +    sample_buffer_renderer_flush(p->displayLayer, true);
 +    sample_buffer_renderer_flush(p->osdLayer, true);
@@ -2693,6 +2747,8 @@ index 0000000000..1b3e13aece
 +
 +    switch (request) {
 +    case VOCTRL_CHECK_EVENTS:
++        if (atomic_exchange(&p->pending_presentation_resync, false))
++            recover_display_layer(vo, "presentation resume", true);
 +        update_avfoundation_options(vo);
 +        return VO_TRUE;
 +    case VOCTRL_VO_OPTS_CHANGED:
