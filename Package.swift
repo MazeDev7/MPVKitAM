@@ -35,7 +35,7 @@ let package = Package(
             name: "_FFmpeg",
             dependencies: [
                 "Libavcodec", "Libavdevice", "Libavfilter", "Libavformat", "Libavutil", "Libswresample", "Libswscale",
-                "Libass", "Libfreetype", "Libfribidi", "Libharfbuzz",
+                "Libssl", "Libcrypto", "Libass", "Libfreetype", "Libfribidi", "Libharfbuzz",
                 "MoltenVK", "Libshaderc_combined", "lcms2", "Libplacebo", "Libdovi", "Libunibreak",
                 "Libdav1d", "Libuavs3d"
             ],
@@ -94,6 +94,18 @@ let package = Package(
             name: "Libbluray",
             url: "https://github.com/mpvkit/libbluray-build/releases/download/1.4.0/Libbluray.xcframework.zip",
             checksum: "bc037d34e2b0b5ab7f202fb371f5fb298136cc66fdf406c2172185d06f53f18d"
+        ),
+
+        .binaryTarget(
+            name: "Libcrypto",
+            url: "https://github.com/mpvkit/openssl-build/releases/download/3.3.5/Libcrypto.xcframework.zip",
+            checksum: "593283be2a90f7fd66f6e6ed331b2f099cf403e0926fe3b4ac09a7062b793965"
+        ),
+
+        .binaryTarget(
+            name: "Libssl",
+            url: "https://github.com/mpvkit/openssl-build/releases/download/3.3.5/Libssl.xcframework.zip",
+            checksum: "ff5ffd43d015d7285fd37e4a3145b25cbd8d2842740bd629a711c299a20e226a"
         ),
 
         .binaryTarget(

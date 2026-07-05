@@ -15,6 +15,7 @@ do {
     try BuildBluray().buildALL()
 
     // ffmpeg
+    try BuildOpenSSL().buildALL()
     try BuildUavs3d().buildALL()
     try BuildDovi().buildALL()
     try BuildVulkan().buildALL()
@@ -34,7 +35,7 @@ do {
 }
 
 enum Library: String, CaseIterable {
-    case libmpv, FFmpeg, libshaderc, vulkan, lcms2, libdovi, libunibreak, libfreetype,
+    case libmpv, FFmpeg, libshaderc, vulkan, lcms2, libdovi, openssl, libunibreak, libfreetype,
         libfribidi, libharfbuzz, libass, libplacebo, libdav1d, libuchardet, libbluray, libluajit, libuavs3d
     var version: String {
         switch self {
@@ -42,6 +43,8 @@ enum Library: String, CaseIterable {
             return "v0.41.0"
         case .FFmpeg:
             return "n8.0.1"
+        case .openssl:
+            return "3.3.5"
         case .libass:
             return "0.18.2"
         case .libunibreak:
@@ -81,6 +84,9 @@ enum Library: String, CaseIterable {
             return "https://github.com/mpv-player/mpv"
         case .FFmpeg:
             return "https://github.com/FFmpeg/FFmpeg"
+        case .openssl:
+            return
+                "https://github.com/mpvkit/openssl-build/releases/download/\(self.version)/openssl-all.zip"
         case .libass:
             return "https://github.com/edde746/libass"
         case .libunibreak:
@@ -183,6 +189,23 @@ enum Library: String, CaseIterable {
                     url:
                         "https://github.com/edde746/MPVKit/releases/download/\(BaseBuild.options.releaseVersion)/Libswscale.xcframework.zip",
                     checksum: ""
+                ),
+            ]
+        case .openssl:
+            return [
+                .target(
+                    name: "Libcrypto",
+                    url:
+                        "https://github.com/mpvkit/openssl-build/releases/download/\(self.version)/Libcrypto.xcframework.zip",
+                    checksum:
+                        "https://github.com/mpvkit/openssl-build/releases/download/\(self.version)/Libcrypto.xcframework.checksum.txt"
+                ),
+                .target(
+                    name: "Libssl",
+                    url:
+                        "https://github.com/mpvkit/openssl-build/releases/download/\(self.version)/Libssl.xcframework.zip",
+                    checksum:
+                        "https://github.com/mpvkit/openssl-build/releases/download/\(self.version)/Libssl.xcframework.checksum.txt"
                 ),
             ]
         case .libass:
@@ -562,7 +585,7 @@ private class BuildFFMPEG: BaseBuild {
         //        }
         let dependencyLibrary = [
             Library.libfreetype, .libharfbuzz, .libfribidi, .libass, .vulkan,
-            .libshaderc, .lcms2, .libplacebo, .libdav1d, .libuavs3d,
+            .libshaderc, .lcms2, .libplacebo, .libdav1d, .libuavs3d, .openssl,
         ]
         for library in dependencyLibrary {
             let path =
@@ -602,7 +625,7 @@ private class BuildFFMPEG: BaseBuild {
         "--disable-armv5te", "--disable-armv6", "--disable-armv6t2",
         "--disable-bzlib", "--disable-gray", "--disable-iconv", "--disable-linux-perf",
         "--disable-shared", "--disable-small", "--disable-symver", "--disable-xlib",
-        "--enable-cross-compile", "--enable-libxml2", "--enable-nonfree",
+        "--enable-cross-compile", "--enable-libxml2",
         "--enable-optimizations", "--enable-pic", "--enable-runtime-cpudetect", "--enable-static",
         "--enable-thumb", "--enable-version3",
         "--pkg-config-flags=--static",
@@ -612,7 +635,7 @@ private class BuildFFMPEG: BaseBuild {
         // Component options:
         "--enable-avcodec", "--enable-avformat", "--enable-avutil", "--enable-network",
         "--enable-swresample", "--enable-swscale",
-        "--enable-securetransport", "--disable-gnutls", "--disable-openssl",
+        "--disable-securetransport", "--disable-gnutls",
         "--disable-libtls", "--disable-mbedtls",
         "--disable-devices", "--disable-outdevs", "--disable-indevs",
         // ,"--disable-pthreads"
@@ -674,6 +697,12 @@ private class BuildFFMPEG: BaseBuild {
         "--enable-filter=vflip_vulkan", "--enable-filter=xfade_vulkan",
     ]
 
+}
+
+private class BuildOpenSSL: ZipBaseBuild {
+    init() {
+        super.init(library: .openssl)
+    }
 }
 
 private class BuildBluray: ZipBaseBuild {

@@ -35,7 +35,7 @@ let package = Package(
             name: "_FFmpeg",
             dependencies: [
                 "Libavcodec", "Libavdevice", "Libavfilter", "Libavformat", "Libavutil", "Libswresample", "Libswscale",
-                "Libass", "Libfreetype", "Libfribidi", "Libharfbuzz",
+                "Libssl", "Libcrypto", "Libass", "Libfreetype", "Libfribidi", "Libharfbuzz",
                 "MoltenVK", "Libshaderc_combined", "lcms2", "Libplacebo", "Libdovi", "Libunibreak",
                 "Libdav1d", "Libuavs3d"
             ],
