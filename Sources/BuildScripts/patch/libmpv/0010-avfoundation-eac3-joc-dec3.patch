@@ -1,0 +1,574 @@
+diff --git a/audio/out/ao_avfoundation.m b/audio/out/ao_avfoundation.m
+index f8df0ee759..a5362c1872 100644
+--- a/audio/out/ao_avfoundation.m
++++ b/audio/out/ao_avfoundation.m
+@@ -25,6 +25,9 @@
+ #include "osdep/timer.h"
+ #include "ta/ta_talloc.h"
+ 
++#include <libavcodec/ac3_parser.h>
++#include <stdatomic.h>
++
+ #import <AVFoundation/AVFoundation.h>
+ #import <Foundation/Foundation.h>
+ #import <CoreAudioTypes/CoreAudioTypes.h>
+@@ -36,6 +39,8 @@ @interface AVObserver : NSObject {
+     struct ao *ao;
+ }
+ - (void)handleRestartNotification:(NSNotification*)notification;
++- (void)handleRenderingModeChange:(NSNotification*)notification;
++- (void)invalidate;
+ @end
+ 
+ struct priv {
+@@ -51,6 +55,10 @@ - (void)handleRestartNotification:(NSNotification*)notification;
+     int spdif_rate;          // decoded rate; the IEC stream runs at ao->samplerate
+     int spdif_burst_size;    // IEC 61937 burst repetition period in bytes
+     bool spdif_bsi_checked;
++    bool spdif_reload_requested;
++    int spdif_config_failures;
++    int spdif_frames_per_packet;
++    int last_rendering_mode;
+     uint8_t *stash;          // carries partial bursts between feed callbacks
+     int stash_len;
+     int stash_size;
+@@ -61,14 +67,11 @@ - (void)handleRestartNotification:(NSNotification*)notification;
+ #define IEC61937_AC3  0x01
+ #define IEC61937_EAC3 0x15
+ 
+-// One IEC 61937 burst carries one (E-)AC-3 access unit worth of audio.
+-#define SPDIF_FRAMES_PER_BURST 1536
+-
+-// Once the system renderer rejects a compressed format, permanently fall
+-// back to PCM for it (per process): ao_request_reload() would otherwise
+-// retry the same spdif format forever, while a failing init makes the
+-// player core fall back to PCM decoding.
++// A failed compressed AO must reject its immediate reload so mpv can decode
++// to PCM. A later successful PCM initialization clears this process-local
++// handoff, allowing another track or playback session to try native audio.
+-static bool spdif_format_latch[2];
++static _Atomic bool spdif_format_latch[2];
++static char avfoundation_queue_key;
+ 
+ static int spdif_latch_index(int format)
+ {
+@@ -92,6 +95,9 @@ static void spdif_reload(struct ao *ao)
+ {
+     struct priv *p = ao->priv;
+ 
++    if (p->spdif_reload_requested)
++        return;
++    p->spdif_reload_requested = true;
+-    spdif_format_latch[spdif_latch_index(ao->format)] = true;
++    atomic_store(&spdif_format_latch[spdif_latch_index(ao->format)], true);
+     [p->renderer stopRequestingMediaData];
+     ao_request_reload(ao);
+@@ -98,3 +104,15 @@ static void spdif_reload(struct ao *ao)
+ }
++
++static bool spdif_note_dropped_burst(struct ao *ao, const char *reason)
++{
++    struct priv *p = ao->priv;
++    MP_WARN(ao, "discarding compressed burst: %s\n", reason);
++    p->next_burst_pts += CMTimeGetNanoseconds(CMTimeMake(1536, p->spdif_rate));
++    if (++p->spdif_config_failures < 3)
++        return true;
++    MP_ERR(ao, "three compressed bursts were discarded; falling back to PCM\n");
++    spdif_reload(ao);
++    return false;
++}
+ 
+ static uint32_t spdif_get_bits(const uint8_t *buf, int offset, int n)
+@@ -131,17 +139,34 @@ static AudioChannelLayoutTag spdif_layout_tag(int acmod, int lfeon, int channels
+ }
+ 
+ static OSStatus spdif_create_format_description(struct ao *ao, int channels,
++                                                int frames_per_packet,
+                                                 AudioChannelLayoutTag layout_tag,
++                                                const uint8_t *dec3, int dec3_size,
+                                                 CMAudioFormatDescriptionRef *format_description)
+ {
+     struct priv *p = ao->priv;
+     AudioStreamBasicDescription asbd = {
+         .mSampleRate       = p->spdif_rate,
+         .mFormatID         = p->spdif_format_id,
+-        .mFramesPerPacket  = SPDIF_FRAMES_PER_BURST,
++        .mFramesPerPacket  = frames_per_packet,
+         .mChannelsPerFrame = channels,
+     };
+     AudioChannelLayout layout = { .mChannelLayoutTag = layout_tag };
++    NSDictionary *extensions = nil;
++    uint8_t magic_cookie[16] = {0};
++    int magic_cookie_size = 0;
++    if (dec3_size > 0) {
++        NSData *data = [NSData dataWithBytes:dec3 length:dec3_size];
++        extensions = @{
++            (NSString *)kCMFormatDescriptionExtension_SampleDescriptionExtensionAtoms:
++                @{ @"dec3": data },
++        };
++        uint32_t atom_size = CFSwapInt32HostToBig(dec3_size + 8);
++        memcpy(magic_cookie, &atom_size, sizeof(atom_size));
++        memcpy(magic_cookie + 4, "dec3", 4);
++        memcpy(magic_cookie + 8, dec3, dec3_size);
++        magic_cookie_size = dec3_size + 8;
++    }
+     return CMAudioFormatDescriptionCreate(
+         NULL,
+         &asbd,
+@@ -149,7 +165,7 @@ static OSStatus spdif_create_format_description(struct ao *ao, int channels,
+         layout_tag ? &layout : NULL,
+-        0,
+-        NULL,
++        magic_cookie_size,
++        magic_cookie_size ? magic_cookie : NULL,
+-        NULL,
++        (CFDictionaryRef)extensions,
+         format_description
+     );
+ }
+@@ -212,41 +228,122 @@ static bool spdif_parse_bsi(const uint8_t *frame, int size, struct spdif_bsi *ou
+     return true;
+ }
+ 
+-// Validate the stream against the format description created in init() and
+-// refine the channel count once. Returns false if the AO is reloading.
+-static bool spdif_check_bsi(struct ao *ao, const uint8_t *frame, int size)
++// Build the compressed format description from the first valid access unit.
++// Returns 1 on success, 0 to discard malformed input, and -1 while reloading.
++static int spdif_configure(struct ao *ao, const uint8_t *frame, int size)
+ {
+     struct priv *p = ao->priv;
+-    struct spdif_bsi bsi;
+ 
+     if (p->spdif_bsi_checked)
+-        return true;
+-
+-    if (!spdif_parse_bsi(frame, size, &bsi)) {
+-        MP_WARN(ao, "failed to parse bitstream info; assuming 5.1\n");
+-        p->spdif_bsi_checked = true;
+-        return true;
++        return 1;
++
++    int rate, channels, frames_per_packet;
++    int num_dep_sub = 0, chan_loc = 0, complexity = 0, joc = 0;
++    AudioChannelLayoutTag layout_tag = 0;
++    uint8_t dec3[8] = {0};
++    int dec3_size = 0;
++    uint64_t access_unit_hash = 1469598103934665603ULL;
++    for (int i = 0; i < size; i++)
++        access_unit_hash = (access_unit_hash ^ frame[i]) * 1099511628211ULL;
++
++    if (p->spdif_format_id == kAudioFormatEnhancedAC3) {
++        int num_blocks;
++        dec3_size = av_eac3_make_dec3(frame, size, dec3, sizeof(dec3),
++                                      &rate, &channels, &num_blocks,
++                                      &num_dep_sub, &chan_loc,
++                                      &complexity, &joc);
++        if (dec3_size < 0) {
++            MP_WARN(ao, "discarding EAC3 access unit: dec3 parse failed (%d)\n",
++                    dec3_size);
++            return 0;
++        }
++        frames_per_packet = num_blocks * 256;
++    } else {
++        struct spdif_bsi bsi;
++        if (!spdif_parse_bsi(frame, size, &bsi)) {
++            MP_WARN(ao, "discarding AC3 access unit with invalid bitstream info\n");
++            return 0;
++        }
++        rate = bsi.rate;
++        channels = bsi.channels;
++        layout_tag = bsi.layout_tag;
++        frames_per_packet = 1536;
+     }
+-    if (bsi.rate != p->spdif_rate) {
++
++    if (rate != p->spdif_rate) {
+         // ad_spdif hardcodes the 4x IEC rate for EAC3, so the core paces
+         // the stream assuming 48 kHz; other rates cannot play correctly
+         MP_ERR(ao, "stream rate %d Hz does not match the IEC rate; "
+-               "falling back to PCM\n", bsi.rate);
++               "falling back to PCM\n", rate);
+         spdif_reload(ao);
+-        return false;
++        return -1;
+     }
++
+     CMAudioFormatDescriptionRef format_description = NULL;
+-    if (spdif_create_format_description(ao, bsi.channels, bsi.layout_tag,
+-                                        &format_description) == noErr) {
++    OSStatus err = spdif_create_format_description(
++        ao, channels, frames_per_packet, layout_tag, dec3, dec3_size,
++        &format_description);
++    if (err != noErr) {
++        MP_ERR(ao, "failed to create compressed format description (%d); "
++               "falling back to PCM\n", err);
++        spdif_reload(ao);
++        return -1;
++    }
++
++    if (p->format_description)
+         CFRelease(p->format_description);
+-        p->format_description = format_description;
++    p->format_description = format_description;
++    p->spdif_frames_per_packet = frames_per_packet;
++    p->spdif_bsi_checked = true;
++
++    if (dec3_size > 0) {
++        char dec3_hex[sizeof(dec3) * 2 + 1] = {0};
++        for (int i = 0; i < dec3_size; i++)
++            snprintf(dec3_hex + i * 2, 3, "%02x", dec3[i]);
++        MP_INFO(ao, "EAC3 config: %d ch, %d Hz, %d blocks, %d dependent, "
++                "chan_loc=0x%x, JOC=%s, complexity=%d, dec3=%s, "
++                "access_unit=%d bytes/%016llx\n",
++                channels, rate, frames_per_packet / 256, num_dep_sub,
++                chan_loc, joc ? "yes" : "no", complexity, dec3_hex, size,
++                (unsigned long long)access_unit_hash);
++    } else {
++        MP_INFO(ao, "AC3 config: %d ch, %d Hz, layout tag 0x%x, "
++                "access_unit=%d bytes/%016llx\n", channels, rate,
++                (unsigned)layout_tag, size, (unsigned long long)access_unit_hash);
+     }
+-    MP_INFO(ao, "bitstream: %d ch, %d Hz, layout tag 0x%x\n",
+-            bsi.channels, bsi.rate, (unsigned)bsi.layout_tag);
+-    p->spdif_bsi_checked = true;
+-    return true;
++    return 1;
+ }
+ 
++#if TARGET_OS_IPHONE
++static const char *rendering_mode_name(AVAudioSessionRenderingMode mode)
++{
++    switch (mode) {
++    case AVAudioSessionRenderingModeNotApplicable: return "not-applicable";
++    case AVAudioSessionRenderingModeMonoStereo:    return "mono-stereo";
++    case AVAudioSessionRenderingModeSurround:      return "surround";
++    case AVAudioSessionRenderingModeSpatialAudio:  return "spatial-audio";
++    case AVAudioSessionRenderingModeDolbyAudio:    return "dolby-audio";
++    case AVAudioSessionRenderingModeDolbyAtmos:    return "dolby-atmos";
++    default:                                       return "unknown";
++    }
++}
++
++static void spdif_log_rendering_mode(struct ao *ao, const char *reason)
++{
++    struct priv *p = ao->priv;
++    if (@available(tvOS 17.2, iOS 17.2, *)) {
++        AVAudioSessionRenderingMode mode = AVAudioSession.sharedInstance.renderingMode;
++        if (mode != p->last_rendering_mode) {
++            MP_INFO(ao, "audio rendering mode: %s (%ld), reason=%s\n",
++                    rendering_mode_name(mode), (long)mode, reason);
++            p->last_rendering_mode = mode;
++        }
++    }
++}
++#else
++static void spdif_log_rendering_mode(struct ao *ao, const char *reason) {}
++#endif
++
+ // Package one IEC 61937 burst payload as a compressed sample and enqueue it.
+ // Returns false if the AO is reloading and feeding should stop.
+ static bool spdif_enqueue_burst(struct ao *ao, const uint8_t *payload, int payload_len)
+@@ -216,14 +341,16 @@ static bool spdif_enqueue_burst(struct ao *ao, const uint8_t *payload, int paylo
+     int alloc_len = MP_ALIGN_UP(payload_len, 2);
+     uint8_t *data = CFAllocatorAllocate(NULL, alloc_len, 0);
+-    if (!data)
+-        return true;
++    if (!data) {
++        MP_ERR(ao, "failed to allocate compressed access unit; falling back to PCM\n");
++        spdif_reload(ao);
++        return false;
++    }
+     // the spdif muxer emits 16-bit LE words; swap back to the raw bitstream
+     for (int i = 0; i < alloc_len; i += 2) {
+         data[i]     = payload[i + 1];
+         data[i + 1] = payload[i];
+     }
+     if (data[0] != 0x0b || data[1] != 0x77) {
+-        MP_WARN(ao, "discarding burst without syncframe\n");
+         CFAllocatorDeallocate(NULL, data);
+-        return true;
++        return spdif_note_dropped_burst(ao, "payload has no AC3 syncframe");
+     }
+@@ -274,6 +402,9 @@ static bool spdif_enqueue_burst(struct ao *ao, const uint8_t *payload, int paylo
+-    if (!spdif_check_bsi(ao, data, payload_len)) {
++    int config = spdif_configure(ao, data, payload_len);
++    if (config <= 0) {
+         CFAllocatorDeallocate(NULL, data);
+-        return false;
++        if (config < 0)
++            return false;
++        return spdif_note_dropped_burst(ao, "access-unit configuration failed");
+     }
+ 
+     if ((err = CMBlockBufferCreateWithMemoryBlock(
+@@ -316,10 +408,12 @@ static bool spdif_enqueue_burst(struct ao *ao, const uint8_t *payload, int paylo
+     }
+ 
+     [p->renderer enqueueSampleBuffer:sample_buffer];
++    spdif_log_rendering_mode(ao, "enqueue");
+     CFRelease(block_buffer);
+     CFRelease(sample_buffer);
+ 
+-    p->next_burst_pts += CMTimeGetNanoseconds(CMTimeMake(SPDIF_FRAMES_PER_BURST, p->spdif_rate));
++    p->next_burst_pts += CMTimeGetNanoseconds(
++        CMTimeMake(p->spdif_frames_per_packet, p->spdif_rate));
+     return true;
+ }
+ 
+@@ -329,6 +423,7 @@ static void feed_spdif(struct ao *ao)
+     int samplerate = ao->samplerate;
+     int sstride = ao->sstride;
+ 
++    spdif_log_rendering_mode(ao, "feed");
+     if ([p->renderer status] == AVQueuedSampleBufferRenderingStatusFailed) {
+         NSError *error = [p->renderer error];
+         MP_ERR(ao, "renderer failed to accept the compressed stream: %s (%s:%ld)\n",
+@@ -335,13 +455,17 @@ static void feed_spdif(struct ao *ao)
+         if (!(data_type == IEC61937_AC3 && p->spdif_format_id == kAudioFormatAC3) &&
+             !(data_type == IEC61937_EAC3 && p->spdif_format_id == kAudioFormatEnhancedAC3)) {
++            if (!spdif_note_dropped_burst(ao, "unexpected IEC 61937 data type"))
++                return;
+             pos++;
+             continue;
+         }
+         // Pd is the payload length in bits for AC3 and in bytes for EAC3
+         int payload_len = data_type == IEC61937_AC3 ? pd / 8 : pd;
+         if (payload_len < 8 || payload_len > p->spdif_burst_size - IEC61937_HEADER_SIZE) {
++            if (!spdif_note_dropped_burst(ao, "invalid IEC 61937 payload length"))
++                return;
+             pos++;
+             continue;
+         }
+         if (pos + IEC61937_HEADER_SIZE + MP_ALIGN_UP(payload_len, 2) > p->stash_len)
+             break; // incomplete burst; wait for more data
+@@ -358,5 +482,8 @@ static void feed_spdif(struct ao *ao)
+     }
+     if (p->stash_len > p->spdif_burst_size * 3) {
+-        MP_WARN(ao, "no IEC 61937 sync found; discarding %d bytes\n", p->stash_len);
++        MP_ERR(ao, "no IEC 61937 sync found in %d bytes; falling back to PCM\n",
++               p->stash_len);
+         p->stash_len = 0;
++        spdif_reload(ao);
++        return;
+     }
+@@ -508,13 +603,17 @@ static void stop(struct ao *ao)
+ {
+     struct priv *p = ao->priv;
+ 
+-    dispatch_sync(p->queue, ^{
++    void (^stop_block)(void) = ^{
+         [p->renderer stopRequestingMediaData];
+         [p->renderer flush];
+         [p->synchronizer setRate:0];
+         p->stash_len = 0;
+         p->next_burst_pts = -1;
+-    });
++    };
++    if (dispatch_get_specific(&avfoundation_queue_key) == p)
++        stop_block();
++    else
++        dispatch_sync(p->queue, stop_block);
+ }
+ 
+ static bool set_pause(struct ao *ao, bool paused)
+@@ -561,12 +683,48 @@ - (instancetype)initWithAO:(struct ao*)_ao {
+     return self;
+ }
+ - (void)handleRestartNotification:(NSNotification*)notification {
+-    char *name = cfstr_get_cstr((CFStringRef)notification.name);
+-    MP_WARN(ao, "restarting due to system notification; this will cause desync\n");
+-    MP_VERBOSE(ao, "notification name: %s\n", name);
+-    talloc_free(name);
+-    stop(ao);
+-    start(ao);
++    @synchronized(self) {
++        if (!ao)
++            return;
++        struct ao *_ao = ao;
++        struct priv *p = _ao->priv;
++        dispatch_async(p->queue, ^{
++            char *name = cfstr_get_cstr((CFStringRef)notification.name);
++            NSValue *value = notification.userInfo[AVSampleBufferAudioRendererFlushTimeKey];
++            CMTime flush_time = value ? value.CMTimeValue : kCMTimeInvalid;
++            MP_WARN(_ao, "renderer configuration changed; serializing flush and refill\n");
++            MP_VERBOSE(_ao, "notification name: %s, flush time: %.3f\n", name,
++                       CMTIME_IS_NUMERIC(flush_time) ? CMTimeGetSeconds(flush_time) : -1.0);
++            talloc_free(name);
++            [p->renderer stopRequestingMediaData];
++            [p->renderer flush];
++            int64_t current = CMTimeGetNanoseconds([p->synchronizer currentTime]);
++            p->stash_len = 0;
++            p->end_time_av = current;
++            p->next_burst_pts = current;
++            [p->renderer requestMediaDataWhenReadyOnQueue:p->queue usingBlock:^{
++                feed(_ao);
++            }];
++        });
++    }
++}
++- (void)handleRenderingModeChange:(NSNotification*)notification {
++    @synchronized(self) {
++        if (!ao)
++            return;
++        struct ao *_ao = ao;
++        struct priv *p = _ao->priv;
++        if (p->spdif) {
++            dispatch_async(p->queue, ^{
++                spdif_log_rendering_mode(_ao, "notification");
++            });
++        }
++    }
++}
++- (void)invalidate {
++    @synchronized(self) {
++        ao = NULL;
++    }
+ }
+ @end
+ 
+@@ -575,29 +695,51 @@ static int init(struct ao *ao)
+     struct priv *p = ao->priv;
+     AudioChannelLayout *layout = NULL;
+     bool spdif = af_fmt_is_spdif(ao->format);
++    p->last_rendering_mode = -1;
++
++    if (!spdif) {
++        atomic_store(&spdif_format_latch[0], false);
++        atomic_store(&spdif_format_latch[1], false);
++    }
+ 
+ #if TARGET_OS_IPHONE
+     AVAudioSession *instance = AVAudioSession.sharedInstance;
+-    NSInteger maxChannels = instance.maximumOutputNumberOfChannels;
+-    // the spdif channel count is IEC 61937 framing, not the real layout;
+-    // open the route at its full width so the system renders the bitstream
+-    // into the multichannel (or Dolby MAT/Atmos) output path instead of a
+-    // stereo/5.1 downmix
+-    NSInteger prefChannels = spdif ? maxChannels : MIN(maxChannels, ao->channels.num);
+-    [instance setCategory:AVAudioSessionCategoryPlayback error:nil];
+-    [instance setMode:AVAudioSessionModeMoviePlayback error:nil];
++    NSError *session_error = nil;
++    if (![instance setCategory:AVAudioSessionCategoryPlayback error:&session_error])
++        MP_WARN(ao, "failed to set playback audio category: %s\n",
++                session_error.localizedDescription.UTF8String);
++    session_error = nil;
++    if (![instance setMode:AVAudioSessionModeMoviePlayback error:&session_error])
++        MP_WARN(ao, "failed to set movie playback audio mode: %s\n",
++                session_error.localizedDescription.UTF8String);
+ #if HAVE_MACOS_12_FEATURES
+-    if (spdif) {
+-        if (@available(tvOS 15.0, iOS 15.0, *))
+-            [instance setSupportsMultichannelContent:YES error:nil];
++    if (@available(tvOS 15.0, iOS 15.0, *)) {
++        session_error = nil;
++        bool multichannel = spdif || ao->channels.num > 2;
++        if (![instance setSupportsMultichannelContent:multichannel error:&session_error])
++            MP_WARN(ao, "failed to configure multichannel content: %s\n",
++                    session_error.localizedDescription.UTF8String);
+     }
+ #endif
+-    [instance setActive:YES error:nil];
+-    [instance setPreferredOutputNumberOfChannels:prefChannels error:nil];
++    session_error = nil;
++    if (![instance setActive:YES error:&session_error])
++        MP_WARN(ao, "failed to activate audio session: %s\n",
++                session_error.localizedDescription.UTF8String);
++    NSInteger maxChannels = instance.maximumOutputNumberOfChannels;
++    if (!spdif) {
++        NSInteger prefChannels = MIN(maxChannels, ao->channels.num);
++        session_error = nil;
++        if (![instance setPreferredOutputNumberOfChannels:prefChannels
++                                                    error:&session_error])
++            MP_WARN(ao, "failed to request %ld PCM output channels: %s\n",
++                    (long)prefChannels, session_error.localizedDescription.UTF8String);
++    }
+     if (spdif) {
+         AVAudioSessionPortDescription *port = instance.currentRoute.outputs.firstObject;
+-        MP_INFO(ao, "audio route: %s, %ld max output channels\n",
+-                port ? [port.portType UTF8String] : "none", (long)maxChannels);
++        MP_INFO(ao, "compressed audio route: %s, %ld current channels, "
++                "%ld maximum channels (diagnostic only)\n",
++                port ? port.portType.UTF8String : "none",
++                (long)port.channels.count, (long)maxChannels);
+     }
+ #endif
+ 
+@@ -606,6 +748,13 @@ static int init(struct ao *ao)
+         MP_VERBOSE(ao, "AVSampleBufferAudioRenderer failed to initialize\n");
+         goto error;
+     }
++#if HAVE_MACOS_12_FEATURES
++    if (spdif) {
++        if (@available(tvOS 15.0, iOS 15.0, macOS 12.0, *))
++            p->renderer.allowedAudioSpatializationFormats =
++                AVAudioSpatializationFormatMultichannel;
++    }
++#endif
+     if ((p->synchronizer = [[AVSampleBufferRenderSynchronizer alloc] init]) == nil) {
+         MP_FATAL(ao, "failed to create rendering synchronizer\n");
+         MP_VERBOSE(ao, "AVSampleBufferRenderSynchronizer failed to initialize\n");
+@@ -619,6 +768,7 @@ static int init(struct ao *ao)
+         MP_VERBOSE(ao, "dispatch_queue_create failed\n");
+         goto error;
+     }
++    dispatch_queue_set_specific(p->queue, &avfoundation_queue_key, p, NULL);
+ 
+     if (ao->device && ao->device[0]) {
+ #if TARGET_OS_OSX
+@@ -662,6 +834,6 @@ static int init(struct ao *ao)
+             goto error;
+         }
+-        if (spdif_format_latch[spdif_latch_index(ao->format)]) {
++        if (atomic_load(&spdif_format_latch[spdif_latch_index(ao->format)])) {
+             MP_FATAL(ao, "%s passthrough disabled after an earlier renderer failure\n",
+                      af_fmt_to_str(ao->format));
+             goto error;
+@@ -670,14 +821,6 @@ static int init(struct ao *ao)
+         p->stash_size = (ao->samplerate / 10) * af_fmt_to_bytes(ao->format) *
+                         ao->channels.num + p->spdif_burst_size * 4;
+         p->stash = talloc_size(ao, p->stash_size);
+-
+-        // refined from the bitstream info in feed_spdif()
+-        if ((err = spdif_create_format_description(ao, 6,
+-                kAudioChannelLayoutTag_MPEG_5_1_A, &p->format_description)) != noErr) {
+-            MP_FATAL(ao, "failed to create audio format description\n");
+-            MP_VERBOSE(ao, "CMAudioFormatDescriptionCreate returned %d\n", err);
+-            goto error;
+-        }
+     } else {
+         // AVSampleBufferAudioRenderer only supports interleaved formats
+         ao->format = af_fmt_from_planar(ao->format);
+@@ -720,6 +863,14 @@ static int init(struct ao *ao)
+     }
+ #endif
+     [center addObserver:p->observer selector:@selector(handleRestartNotification:) name:AVSampleBufferAudioRendererWasFlushedAutomaticallyNotification object:p->renderer];
++#if TARGET_OS_IPHONE
++    if (@available(tvOS 17.2, iOS 17.2, *)) {
++        [center addObserver:p->observer
++                   selector:@selector(handleRenderingModeChange:)
++                       name:AVAudioSessionRenderingModeChangeNotification
++                     object:AVAudioSession.sharedInstance];
++    }
++#endif
+ 
+     return CONTROL_OK;
+ 
+@@ -744,14 +917,15 @@ static void uninit(struct ao *ao)
+ {
+     struct priv *p = ao->priv;
+ 
++    [p->observer invalidate];
++    [[NSNotificationCenter defaultCenter] removeObserver:p->observer];
+     stop(ao);
+ 
+     [p->renderer release];
+     [p->synchronizer release];
+     dispatch_release(p->queue);
+-    CFRelease(p->format_description);
++    if (p->format_description) CFRelease(p->format_description);
+ 
+-    [[NSNotificationCenter defaultCenter] removeObserver:p->observer];
+     [p->observer release];
+ 
+ #if TARGET_OS_IPHONE
