@@ -46,7 +46,7 @@ enum Library: String, CaseIterable {
         case .openssl:
             return "3.3.5"
         case .libass:
-            return "0.18.2"
+            return "0.18.3"
         case .libunibreak:
             return "0.17.4"
         case .libfreetype:
